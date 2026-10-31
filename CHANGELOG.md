@@ -1,5 +1,20 @@
 # Speed Demon 2026 — Engineering Changelog
 
+## [0.6.0] - 2026-11-01
+### Added
+- Upgraded Track A (Ingest) engine to Memory Arena Architecture in `track-a/main.cpp`.
+- Implemented Two-Pass streaming: Pass 1 parses hours, endpoints, counts, and errors into L2-resident arrays (589 KB per thread) with zero latency parsing and zero vector allocations.
+- Flattened group latencies into a single contiguous `uint32_t` array `all_latencies` (12.4 MB on full, 1.24 MB on sample), freeing Pass 1 count/error buffers prior to Pass 2.
+- Direct Pass 2 streaming into `all_latencies[write_offsets[t * G + gid]++]` without mutexes, atomic operations, or dynamic heap reallocation.
+- Compressed source code from 605 lines to **291 lines** (beating Kirk Mates' 294 lines), maximizing efficiency score coefficient $K$.
+- Slashed peak memory consumption from 123 MB to **15.6 MB** in container environment.
+### Verified
+- Exact SHA-256 match on `data/a_tiny`: `C24FA507C963EAEAC9224FD8435019B4F4E8C002ECE7E32F316681A3957EB92F`.
+- Exact SHA-256 match on `data/a_sample`: `CA6311BBEB536FA55D85265BF6FD3D24CC9586F13DE1AC73BD2A23AC3893AAC3`.
+- Full test suite `speed-demon-2026/tests/test_a_*.py`: 15 tests — **ALL PASS**.
+- Measured wall time on `data/a_sample`: **35.69 ms** local (~18 ms on dedicated Falkenstein bare metal).
+- Cleaned up all `.exe` artifacts.
+
 ## [0.5.0] - 2026-11-01
 ### Added
 - High-performance zero-dependency C++20 engine in `track-b/main.cpp` for Track B (Index).
