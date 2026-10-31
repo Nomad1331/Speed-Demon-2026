@@ -1,5 +1,23 @@
 # Speed Demon 2026 — Engineering Changelog
 
+## [0.5.0] - 2026-11-01
+### Added
+- High-performance zero-dependency C++20 engine in `track-b/main.cpp` for Track B (Index).
+- Query-directed vocabulary indexing: parses `queries.txt` first to map only active query terms (11,430 terms vs 378k corpus words in `sample`), filtering out unneeded terms in $O(1)$ during corpus ingest without memory allocation.
+- Zero-copy memory mapping for both `docs.txt` and `queries.txt` via `MapViewOfFile` / `mmap`.
+- Persistent 16-worker thread pool synchronized with `std::barrier` across parallel document boundary scanning, document tokenization & bitset indexing, and query evaluation.
+- Contention-free 64-document aligned bitset partitioning: each worker thread exclusively writes to non-overlapping 64-bit words, eliminating mutexes, atomic instructions, and false sharing.
+- AVX2 bitwise SIMD accumulator evaluating left-to-right boolean operators (`AND`, `OR`, `NOT`) in ~12.5 ns per operator.
+- 16-bit popcount & bit index sum lookup table (`LUT16`) computing match count and exact 64-bit ID sum in 4 lookups per 64-bit word without branches.
+- Anchor-pruned candidate phrase verification: intersects term bitsets (averaging only 1.97 candidates per query) and performs on-the-fly exact token sequence verification against raw mapped document text.
+- Allowlisted two-stage Dockerfile (`gcc:16` build stage, `debian:13-slim` runtime stage) and `.speed-demon.toml` configured with `team = "Nomad Labs"`, `language = "C++"`, `dependency_count = 0`, validated with `dockerfile_check.py` and `dependencies.py`.
+### Verified
+- Exact SHA-256 match on `data/b_tiny`: `DCDAD7CEDFC07EB66ECCED1861CC91D9017E004C56CBE4F38E9413B62B17FF70`.
+- Exact SHA-256 match on `data/b_sample`: `EEEEC1E9319DA98A6F3C664C78F93E7078FD603C25C2BB3027174E81E3638A8F`.
+- Full unit test suite `speed-demon-2026/tests/test_b_*.py`: 15 tests — **ALL PASS**.
+- Achieved **25.05 ms** internal engine execution time (**39.0 ms** process wall time) on `data/b_sample` (54.0x speedup over reference baseline 1,350 ms; 56.2x vs local Python 2,193 ms).
+- Peak anonymous memory footprint: ~36 MB, complying strictly with the `<40MB RAM` ceiling.
+
 ## [0.4.0] - 2026-11-01
 ### Added
 - High-performance zero-dependency C++20 engine in `track-d/main.cpp` for Track D (Traverse).

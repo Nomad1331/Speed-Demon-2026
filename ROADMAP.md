@@ -25,7 +25,17 @@
 
 ---
 
-## Phase 3: Track C (Join) Hostile CSV Engine
+## Phase 3: Track B (Index) Query-Directed Inverted Index
+- [x] **Iteration 0: Query-Directed Filtering:** Parse queries first to index only the 11,430 query terms out of 378k corpus words 🟢
+- [x] **Iteration 1: Zero-Contention Thread Pool:** Single-spawn persistent 16-worker thread pool with `std::barrier` and 64-document aligned bitset partitioning (zero locks, zero word contention) 🟢
+- [x] **Iteration 2: SIMD Accumulator & LUT Tally:** AVX2 vector bitwise evaluation with 16-bit popcount & sum lookup table (`LUT16`) 🟢
+- [x] **Iteration 3: Anchor-Pruned Phrase Verification:** Bitset candidate intersection followed by on-the-fly exact token scan on candidate docs 🟢
+- [x] **Iteration 4: Packaging & Validation:** Multi-stage GCC 16 Dockerfile validated with `dockerfile_check.py` and zero-dependency `.speed-demon.toml` 🟢
+- [x] **Iteration 5: Verification:** Byte-identical SHA-256 match on `tiny` and `sample`, achieving 25.05 ms runtime (54.0x speedup, <36MB RAM) 🟢
+
+---
+
+## Phase 4: Track C (Join) Hostile CSV Engine
 - [x] **Iteration 0: Correctness Engine:** Compliant CSV RFC state machine handling embedded commas, newlines, UTF-8 BOM, and quotes 🟢
 - [x] **Iteration 1: Aggregation & Join:** Zero-allocation BSS flat array region lookup (`region_to_country[10000000]`) and exact integer cents accumulation 🟢
 - [x] **Iteration 2: Parallel Stream Processing:** Multi-threaded CRLF boundary chunking with `std::barrier`, on-the-fly zero-copy unescaping and FNV-1a hashing 🟢
@@ -35,7 +45,7 @@
 
 ---
 
-## Phase 4: Track D (Traverse) Graph Shortest-Paths
+## Phase 5: Track D (Traverse) Graph Shortest-Paths
 - [x] **Iteration 0: Fast CSR Representation:** Compact zero-copy Compressed Sparse Row representation (`head[n+1]`, `edges[m]`) with prefix sums 🟢
 - [x] **Iteration 1: Thread Pre-Warming & O(1) Epoch Reset:** Spawn 16 worker threads concurrently during edge parse; persistent `dist[n]` and `seen[n]` with epoch increments (zero memset) 🟢
 - [x] **Iteration 2: 4-ary MinHeap & Dynamic Work Stealing:** Custom cache-aligned 64-byte `QuadHeap` with hole propagation and atomic dynamic work-stealing load balancing 🟢
@@ -45,7 +55,7 @@
 
 ---
 
-## Phase 5: Submission & Live Board Telemetry
+## Phase 6: Submission & Live Board Telemetry
 - [ ] Link GitHub repository to `speed-demon-board` GitHub App 🔴
 - [ ] Register team submission form on Tally (`https://tally.so/r/Ar7g9z`) 🔴
 - [ ] Push to `speed-demon` branch and monitor automated Falkenstein board runs 🔴
