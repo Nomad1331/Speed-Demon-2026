@@ -1,5 +1,23 @@
 # Speed Demon 2026 — Engineering Changelog
 
+## [0.4.0] - 2026-11-01
+### Added
+- High-performance zero-dependency C++20 engine in `track-d/main.cpp` for Track D (Traverse).
+- Memory-mapped zero-copy file streaming for `graph.txt` and `queries.txt` with `MapViewOfFile` / `mmap`.
+- Compact Compressed Sparse Row (CSR) graph layout (`head[n+1]` index array and `edges[m]` contiguous edge array of 8-byte `{uint32_t v; uint32_t w;}`).
+- Concurrent worker thread initialization: 16 worker threads spawned immediately after parsing graph header (`n, m`), pre-allocating Dijkstra query buffers in parallel during edge text parsing and CSR construction, completely hiding thread creation latency.
+- Epoch-based $O(1)$ Dijkstra state reset (`seen[v] != cur_epoch`) with persistent `dist[n]` and `seen[n]`, eliminating 22 MB of `memset` memory writes per query.
+- Custom cache-aligned 64-byte 4-ary MinHeap (`QuadHeap`) with hole propagation, halving tree depth ($log_4 N$) and fitting 4 sibling children in a single CPU cache line with internal buffer retention across queries.
+- Dynamic atomic work stealing (`std::atomic<size_t> query_cursor.fetch_add(1)`) providing optimal load balancing across 16 threads without query stragglers.
+- $O(1)$ reachability pruning: immediate answers for `s == t` (0) and disconnected nodes (`out_degree[s] == 0` or `in_degree[t] == 0` -> -1), preventing expensive full-graph traversals.
+- Fast bounds-free integer parsing and 2-digit LUT integer formatter writing directly to binary LF-terminated output buffer.
+- Allowlisted two-stage Dockerfile (`gcc:16` build stage, `debian:13-slim` runtime stage) and `.speed-demon.toml` configured with `team = "Nomad Labs"`, `language = "C++"`, `dependency_count = 0`, validated against `check.py`.
+### Verified
+- Exact SHA-256 match on `data/d_tiny`: `ECACA77D3221FE3928109DA36480CFDB39F288F2E57ECBC61D3D7706D5CB4BD5`.
+- Exact SHA-256 match on `data/d_sample`: `A4C76ED030BC7E365DB33191F6CF74708FBA7F25EB48D64C8C4279F2E57046A0`.
+- Verified across all unit test cases (worked example, parallel lighter/heavier edges, 3-way duplicates, 0-weight cycles, unreachable nodes, 64-bit distances, multi-seeds 2, 7, 42, 99).
+- Achieved **62.44 ms** execution time on `data/d_sample` (60.6x speedup over Python reference baseline 3,787 ms; 59.4x vs measured Python 3,708.76 ms).
+
 ## [0.3.0] - 2026-11-01
 ### Added
 - High-performance zero-dependency C++20 engine in `track-c/main.cpp` for Track C (Join).

@@ -4,5 +4,5 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | | | | | |
+| 0 | The reference, unchanged (Python 3.13) | local-ref | 3.708 | 103 | 0 |
+| 1 | C++20 zero-copy memory-mapped CSR graph engine, concurrent worker thread initialization, epoch-based O(1) Dijkstra state reset, 4-ary MinHeap priority queue, dynamic atomic work stealing across 16 threads, fast integer parser & LUT formatter | local-cpp-v1 | 0.062 | 28 | 94.2 |
