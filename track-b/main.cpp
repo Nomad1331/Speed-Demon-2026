@@ -260,6 +260,12 @@ inline bool phrase_tokens_match(std::string_view phrase_term, const TokenRef& to
     return true;
 }
 
+struct TermInfo {
+    uint32_t df = 0;
+    uint32_t dense_idx = UINT32_MAX; // if dense, index in dense_bitsets
+    uint32_t sparse_offset = 0;      // if sparse, start index in sparse_postings
+};
+
 int main(int argc, char** argv) {
     std::ios_base::sync_with_stdio(false);
     std::string data_dir = "/data";
@@ -361,7 +367,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Determine N quickly from end of docs.txt
     uint32_t N = 0;
     if (docs_file.size > 0) {
         const char* end_ptr = docs_file.data + docs_file.size;
@@ -380,16 +385,24 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> doc_lens(N);
     size_t num_words = (N + 63) / 64;
 
-    // 3. Allocate Inverted Index Bitsets
-    size_t total_u64 = (size_t)num_query_terms * num_words;
-    uint64_t* bitsets = (uint64_t*)calloc(total_u64 > 0 ? total_u64 : 1, sizeof(uint64_t));
-
-    // Determine thread count
     unsigned int hw_threads = std::thread::hardware_concurrency();
     if (hw_threads == 0) hw_threads = 8;
     unsigned int num_threads = std::min(hw_threads, 16u);
 
-    std::barrier sync_point(num_threads);
+    // Adaptive threshold for dense vs sparse:
+    // Ensures peak dense bitset memory NEVER exceeds 25 MB on full!
+    uint32_t DF_THRESHOLD = std::max(256u, (uint32_t)(N / 128));
+
+    std::vector<TermInfo> terms(num_query_terms);
+    uint64_t* dense_bitsets = nullptr;
+    uint32_t* sparse_postings = nullptr;
+    uint32_t num_dense_terms = 0;
+    uint32_t total_sparse_postings = 0;
+
+    // Per-thread state for Pass 1 (counting) and Pass 2 (indexing)
+    std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(num_query_terms, 0));
+    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_query_terms, 0));
+    std::vector<std::vector<uint32_t>> thread_last_seen(num_threads, std::vector<uint32_t>(num_query_terms, 0xFFFFFFFF));
 
     size_t chunk_bytes = docs_file.size / num_threads;
     size_t step = ((N + num_threads - 1) / num_threads + 63) & ~63ULL;
@@ -399,15 +412,18 @@ int main(int argc, char** argv) {
     size_t q_step = (num_queries + num_threads - 1) / num_threads;
     std::vector<std::string> thread_outputs(num_threads);
 
-    std::chrono::high_resolution_clock::time_point t_docs_scan;
-    std::chrono::high_resolution_clock::time_point t_index;
+    std::barrier sync_point(num_threads);
+
+    std::chrono::high_resolution_clock::time_point t_pass1;
+    std::chrono::high_resolution_clock::time_point t_pass2;
     std::chrono::high_resolution_clock::time_point t_queries_done;
 
-    // Persistent Worker Thread Pool executing all 3 stages
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            // Stage 1: Parallel document boundary scan
+            // ==========================================
+            // Stage 0: Document boundary scan
+            // ==========================================
             size_t b_start = tid * chunk_bytes;
             size_t b_end = (tid == num_threads - 1) ? docs_file.size : (tid + 1) * chunk_bytes;
 
@@ -436,17 +452,18 @@ int main(int argc, char** argv) {
             }
 
             sync_point.arrive_and_wait();
-            if (tid == 0 && profile) t_docs_scan = std::chrono::high_resolution_clock::now();
 
-            // Stage 2: Parallel document indexing into bitsets
+            // ==========================================
+            // Stage 1 (Pass 1): Count query term df for assigned docs
+            // ==========================================
             size_t d_start = tid * step;
             size_t d_end = std::min((size_t)N, (tid + 1) * step);
+            uint32_t* my_last_seen = thread_last_seen[tid].data();
+            uint32_t* my_df = thread_df[tid].data();
 
             for (size_t d = d_start; d < d_end; ++d) {
                 const char* dp = docs_file.data + doc_offsets[d];
                 const char* text_end = dp + doc_lens[d];
-                size_t word_idx = d >> 6;
-                uint64_t bit_mask = 1ULL << (d & 63);
 
                 while (dp < text_end) {
                     uint8_t c = CHAR_MAP[(unsigned char)*dp++];
@@ -466,15 +483,98 @@ int main(int argc, char** argv) {
 
                     uint32_t term_id = term_table.lookup(hash, tok_start, tok_len);
                     if (term_id != UINT32_MAX) {
-                        bitsets[term_id * num_words + word_idx] |= bit_mask;
+                        if (my_last_seen[term_id] != (uint32_t)d) {
+                            my_last_seen[term_id] = (uint32_t)d;
+                            my_df[term_id]++;
+                        }
                     }
                 }
             }
 
             sync_point.arrive_and_wait();
-            if (tid == 0 && profile) t_index = std::chrono::high_resolution_clock::now();
 
+            // Thread 0 allocates dense & sparse pools
+            if (tid == 0) {
+                if (profile) t_pass1 = std::chrono::high_resolution_clock::now();
+                uint32_t cur_sparse_offset = 0;
+                for (uint32_t t = 0; t < num_query_terms; ++t) {
+                    uint32_t tot = 0;
+                    for (unsigned int k = 0; k < num_threads; ++k) {
+                        tot += thread_df[k][t];
+                    }
+                    terms[t].df = tot;
+
+                    if (tot >= DF_THRESHOLD) {
+                        terms[t].dense_idx = num_dense_terms++;
+                    } else if (tot > 0) {
+                        terms[t].sparse_offset = cur_sparse_offset;
+                        uint32_t running = cur_sparse_offset;
+                        for (unsigned int k = 0; k < num_threads; ++k) {
+                            thread_write_offsets[k][t] = running;
+                            running += thread_df[k][t];
+                        }
+                        cur_sparse_offset += tot;
+                    }
+                }
+                total_sparse_postings = cur_sparse_offset;
+
+                size_t dense_u64 = (size_t)num_dense_terms * num_words;
+                dense_bitsets = (uint64_t*)calloc(dense_u64 > 0 ? dense_u64 : 1, sizeof(uint64_t));
+                sparse_postings = (uint32_t*)malloc((size_t)(total_sparse_postings > 0 ? total_sparse_postings : 1) * sizeof(uint32_t));
+            }
+
+            sync_point.arrive_and_wait();
+
+            // ==========================================
+            // Stage 2 (Pass 2): Populate dense bitsets and sorted sparse postings
+            // ==========================================
+            uint32_t* my_write_offsets = thread_write_offsets[tid].data();
+            uint32_t pass2_mark = N; // doc_id + N to distinguish from pass 1
+
+            for (size_t d = d_start; d < d_end; ++d) {
+                const char* dp = docs_file.data + doc_offsets[d];
+                const char* text_end = dp + doc_lens[d];
+                size_t word_idx = d >> 6;
+                uint64_t bit_mask = 1ULL << (d & 63);
+                uint32_t doc_mark = (uint32_t)(d + pass2_mark);
+
+                while (dp < text_end) {
+                    uint8_t c = CHAR_MAP[(unsigned char)*dp++];
+                    if (!c) continue;
+
+                    uint64_t hash = 14695981039346656037ULL;
+                    const char* tok_start = dp - 1;
+                    hash = (hash ^ c) * 1099511628211ULL;
+
+                    while (dp < text_end) {
+                        c = CHAR_MAP[(unsigned char)*dp];
+                        if (!c) break;
+                        hash = (hash ^ c) * 1099511628211ULL;
+                        dp++;
+                    }
+                    uint32_t tok_len = (uint32_t)(dp - tok_start);
+
+                    uint32_t term_id = term_table.lookup(hash, tok_start, tok_len);
+                    if (term_id != UINT32_MAX) {
+                        const TermInfo& ti = terms[term_id];
+                        if (ti.dense_idx != UINT32_MAX) {
+                            dense_bitsets[ti.dense_idx * num_words + word_idx] |= bit_mask;
+                        } else {
+                            if (my_last_seen[term_id] != doc_mark) {
+                                my_last_seen[term_id] = doc_mark;
+                                sparse_postings[my_write_offsets[term_id]++] = (uint32_t)d;
+                            }
+                        }
+                    }
+                }
+            }
+
+            sync_point.arrive_and_wait();
+            if (tid == 0 && profile) t_pass2 = std::chrono::high_resolution_clock::now();
+
+            // ==========================================
             // Stage 3: Parallel query execution
+            // ==========================================
             size_t q_start = tid * q_step;
             size_t q_end = std::min(num_queries, (tid + 1) * q_step);
 
@@ -482,6 +582,8 @@ int main(int argc, char** argv) {
             out.reserve((q_end > q_start ? (q_end - q_start) : 1) * 32);
 
             std::vector<uint64_t> accum(num_words > 0 ? num_words : 1);
+            std::vector<uint32_t> survivors;
+            survivors.reserve(DF_THRESHOLD + 64);
             std::vector<uint32_t> candidates;
             std::vector<uint32_t> matches;
             TokenRef doc_tokens[1024];
@@ -490,89 +592,216 @@ int main(int argc, char** argv) {
             for (size_t qidx = q_start; qidx < q_end; ++qidx) {
                 const Query& q = queries[qidx];
                 if (q.type == QueryType::BOOL_QUERY) {
-                    uint32_t t0 = q.b.term_ids[0];
-                    memcpy(accum.data(), bitsets + (size_t)t0 * num_words, num_words * sizeof(uint64_t));
+                    bool accum_empty = false;
+                    const TermInfo& info0 = terms[q.b.term_ids[0]];
+
+                    if (info0.df == 0) {
+                        accum_empty = true;
+                    } else if (info0.dense_idx != UINT32_MAX) {
+                        memcpy(accum.data(), dense_bitsets + (size_t)info0.dense_idx * num_words, num_words * sizeof(uint64_t));
+                    } else {
+                        memset(accum.data(), 0, num_words * sizeof(uint64_t));
+                        const uint32_t* ids = sparse_postings + info0.sparse_offset;
+                        for (uint32_t j = 0; j < info0.df; ++j) {
+                            uint32_t id = ids[j];
+                            accum[id >> 6] |= 1ULL << (id & 63);
+                        }
+                    }
 
                     for (int i = 1; i < q.b.num_terms; ++i) {
                         BoolOp op = q.b.ops[i - 1];
-                        uint32_t t = q.b.term_ids[i];
-                        const uint64_t* term_bits = bitsets + (size_t)t * num_words;
+                        const TermInfo& tinfo = terms[q.b.term_ids[i]];
+
+                        if (tinfo.df == 0) {
+                            if (op == BoolOp::AND) accum_empty = true;
+                            continue;
+                        }
+
+                        if (accum_empty) {
+                            if (op == BoolOp::AND || op == BoolOp::NOT) continue;
+                            // empty OR t = t
+                            if (tinfo.dense_idx != UINT32_MAX) {
+                                memcpy(accum.data(), dense_bitsets + (size_t)tinfo.dense_idx * num_words, num_words * sizeof(uint64_t));
+                                accum_empty = false;
+                            } else {
+                                memset(accum.data(), 0, num_words * sizeof(uint64_t));
+                                const uint32_t* ids = sparse_postings + tinfo.sparse_offset;
+                                for (uint32_t j = 0; j < tinfo.df; ++j) {
+                                    uint32_t id = ids[j];
+                                    accum[id >> 6] |= 1ULL << (id & 63);
+                                }
+                                accum_empty = false;
+                            }
+                            continue;
+                        }
 
                         if (op == BoolOp::AND) {
-                            for (size_t w = 0; w < num_words; ++w) accum[w] &= term_bits[w];
-                        } else if (op == BoolOp::OR) {
-                            for (size_t w = 0; w < num_words; ++w) accum[w] |= term_bits[w];
-                        } else if (op == BoolOp::NOT) {
-                            for (size_t w = 0; w < num_words; ++w) accum[w] &= ~term_bits[w];
-                        }
-                    }
-
-                    uint32_t count = 0;
-                    uint64_t sum = 0;
-                    uint32_t first10[10];
-                    uint32_t found = 0;
-
-                    for (size_t w = 0; w < num_words; ++w) {
-                        uint64_t val = accum[w];
-                        if (!val) continue;
-
-                        uint64_t base_id = w * 64;
-                        if (found < 10) {
-                            uint64_t temp = val;
-                            while (temp) {
-                                int bit = std::countr_zero(temp);
-                                uint32_t doc_id = (uint32_t)(base_id + bit);
-                                sum += doc_id;
-                                if (found < 10) first10[found++] = doc_id;
-                                temp &= temp - 1;
+                            if (tinfo.dense_idx != UINT32_MAX) {
+                                const uint64_t* term_bits = dense_bitsets + (size_t)tinfo.dense_idx * num_words;
+                                for (size_t w = 0; w < num_words; ++w) accum[w] &= term_bits[w];
+                            } else {
+                                const uint32_t* ids = sparse_postings + tinfo.sparse_offset;
+                                survivors.clear();
+                                for (uint32_t j = 0; j < tinfo.df; ++j) {
+                                    uint32_t id = ids[j];
+                                    if ((accum[id >> 6] >> (id & 63)) & 1ULL) {
+                                        survivors.push_back(id);
+                                    }
+                                }
+                                if (survivors.empty()) {
+                                    accum_empty = true;
+                                } else {
+                                    memset(accum.data(), 0, num_words * sizeof(uint64_t));
+                                    for (uint32_t id : survivors) {
+                                        accum[id >> 6] |= 1ULL << (id & 63);
+                                    }
+                                }
                             }
-                            count += (uint32_t)std::popcount(val);
-                        } else {
-                            uint16_t c0 = (uint16_t)(val);
-                            uint16_t c1 = (uint16_t)(val >> 16);
-                            uint16_t c2 = (uint16_t)(val >> 32);
-                            uint16_t c3 = (uint16_t)(val >> 48);
-
-                            sum += LUT16[c0].sum + (uint64_t)LUT16[c0].count * base_id;
-                            sum += LUT16[c1].sum + (uint64_t)LUT16[c1].count * (base_id + 16);
-                            sum += LUT16[c2].sum + (uint64_t)LUT16[c2].count * (base_id + 32);
-                            sum += LUT16[c3].sum + (uint64_t)LUT16[c3].count * (base_id + 48);
-
-                            count += (uint32_t)(LUT16[c0].count + LUT16[c1].count + LUT16[c2].count + LUT16[c3].count);
+                        } else if (op == BoolOp::OR) {
+                            if (tinfo.dense_idx != UINT32_MAX) {
+                                const uint64_t* term_bits = dense_bitsets + (size_t)tinfo.dense_idx * num_words;
+                                for (size_t w = 0; w < num_words; ++w) accum[w] |= term_bits[w];
+                            } else {
+                                const uint32_t* ids = sparse_postings + tinfo.sparse_offset;
+                                for (uint32_t j = 0; j < tinfo.df; ++j) {
+                                    uint32_t id = ids[j];
+                                    accum[id >> 6] |= 1ULL << (id & 63);
+                                }
+                            }
+                        } else if (op == BoolOp::NOT) {
+                            if (tinfo.dense_idx != UINT32_MAX) {
+                                const uint64_t* term_bits = dense_bitsets + (size_t)tinfo.dense_idx * num_words;
+                                for (size_t w = 0; w < num_words; ++w) accum[w] &= ~term_bits[w];
+                            } else {
+                                const uint32_t* ids = sparse_postings + tinfo.sparse_offset;
+                                for (uint32_t j = 0; j < tinfo.df; ++j) {
+                                    uint32_t id = ids[j];
+                                    accum[id >> 6] &= ~(1ULL << (id & 63));
+                                }
+                            }
                         }
                     }
 
-                    if (count == 0) {
+                    if (accum_empty) {
                         out.append("0 0\n");
                     } else {
-                        char* p = line_buf;
-                        p = write_u64_fast(p, count);
-                        *p++ = ' ';
-                        p = write_u64_fast(p, sum);
-                        for (uint32_t i = 0; i < found; ++i) {
-                            *p++ = ' ';
-                            p = write_u64_fast(p, first10[i]);
+                        uint32_t count = 0;
+                        uint64_t sum = 0;
+                        uint32_t first10[10];
+                        uint32_t found = 0;
+
+                        for (size_t w = 0; w < num_words; ++w) {
+                            uint64_t val = accum[w];
+                            if (!val) continue;
+
+                            uint64_t base_id = w * 64;
+                            if (found < 10) {
+                                uint64_t temp = val;
+                                while (temp) {
+                                    int bit = std::countr_zero(temp);
+                                    uint32_t doc_id = (uint32_t)(base_id + bit);
+                                    sum += doc_id;
+                                    if (found < 10) first10[found++] = doc_id;
+                                    temp &= temp - 1;
+                                }
+                                count += (uint32_t)std::popcount(val);
+                            } else {
+                                uint16_t c0 = (uint16_t)(val);
+                                uint16_t c1 = (uint16_t)(val >> 16);
+                                uint16_t c2 = (uint16_t)(val >> 32);
+                                uint16_t c3 = (uint16_t)(val >> 48);
+
+                                sum += LUT16[c0].sum + (uint64_t)LUT16[c0].count * base_id;
+                                sum += LUT16[c1].sum + (uint64_t)LUT16[c1].count * (base_id + 16);
+                                sum += LUT16[c2].sum + (uint64_t)LUT16[c2].count * (base_id + 32);
+                                sum += LUT16[c3].sum + (uint64_t)LUT16[c3].count * (base_id + 48);
+
+                                count += (uint32_t)(LUT16[c0].count + LUT16[c1].count + LUT16[c2].count + LUT16[c3].count);
+                            }
                         }
-                        *p++ = '\n';
-                        out.append(line_buf, p - line_buf);
+
+                        if (count == 0) {
+                            out.append("0 0\n");
+                        } else {
+                            char* p = line_buf;
+                            p = write_u64_fast(p, count);
+                            *p++ = ' ';
+                            p = write_u64_fast(p, sum);
+                            for (uint32_t i = 0; i < found; ++i) {
+                                *p++ = ' ';
+                                p = write_u64_fast(p, first10[i]);
+                            }
+                            *p++ = '\n';
+                            out.append(line_buf, p - line_buf);
+                        }
                     }
                 } else { // PHRASE_QUERY
-                    uint32_t t0 = q.p.term_ids[0];
-                    memcpy(accum.data(), bitsets + (size_t)t0 * num_words, num_words * sizeof(uint64_t));
+                    bool has_absent = false;
+                    int best_idx = 0;
+                    uint32_t min_df = terms[q.p.term_ids[0]].df;
 
-                    for (int i = 1; i < q.p.num_terms; ++i) {
-                        uint32_t t = q.p.term_ids[i];
-                        const uint64_t* term_bits = bitsets + (size_t)t * num_words;
-                        for (size_t w = 0; w < num_words; ++w) accum[w] &= term_bits[w];
+                    for (int i = 0; i < q.p.num_terms; ++i) {
+                        uint32_t cdf = terms[q.p.term_ids[i]].df;
+                        if (cdf == 0) {
+                            has_absent = true;
+                            break;
+                        }
+                        if (cdf < min_df) {
+                            min_df = cdf;
+                            best_idx = i;
+                        }
+                    }
+
+                    if (has_absent) {
+                        out.append("0 0\n");
+                        continue;
                     }
 
                     candidates.clear();
-                    for (size_t w = 0; w < num_words; ++w) {
-                        uint64_t val = accum[w];
-                        while (val) {
-                            int bit = std::countr_zero(val);
-                            candidates.push_back((uint32_t)(w * 64 + bit));
-                            val &= val - 1;
+                    const TermInfo& rarest = terms[q.p.term_ids[best_idx]];
+
+                    if (rarest.dense_idx != UINT32_MAX) {
+                        // All terms in phrase are dense
+                        memcpy(accum.data(), dense_bitsets + (size_t)rarest.dense_idx * num_words, num_words * sizeof(uint64_t));
+                        for (int i = 0; i < q.p.num_terms; ++i) {
+                            if (i == best_idx) continue;
+                            const TermInfo& ti = terms[q.p.term_ids[i]];
+                            const uint64_t* tb = dense_bitsets + (size_t)ti.dense_idx * num_words;
+                            for (size_t w = 0; w < num_words; ++w) accum[w] &= tb[w];
+                        }
+                        for (size_t w = 0; w < num_words; ++w) {
+                            uint64_t val = accum[w];
+                            while (val) {
+                                int bit = std::countr_zero(val);
+                                candidates.push_back((uint32_t)(w * 64 + bit));
+                                val &= val - 1;
+                            }
+                        }
+                    } else {
+                        // Rarest term is SPARSE (sorted doc IDs)
+                        const uint32_t* r_ids = sparse_postings + rarest.sparse_offset;
+                        for (uint32_t i = 0; i < rarest.df; ++i) {
+                            uint32_t doc_id = r_ids[i];
+                            bool in_all = true;
+                            for (int j = 0; j < q.p.num_terms; ++j) {
+                                if (j == best_idx) continue;
+                                const TermInfo& ti = terms[q.p.term_ids[j]];
+                                if (ti.dense_idx != UINT32_MAX) {
+                                    if (!((dense_bitsets[(size_t)ti.dense_idx * num_words + (doc_id >> 6)] >> (doc_id & 63)) & 1ULL)) {
+                                        in_all = false;
+                                        break;
+                                    }
+                                } else {
+                                    const uint32_t* s_ids = sparse_postings + ti.sparse_offset;
+                                    if (!std::binary_search(s_ids, s_ids + ti.df, doc_id)) {
+                                        in_all = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (in_all) {
+                                candidates.push_back(doc_id);
+                            }
                         }
                     }
 
@@ -657,21 +886,26 @@ int main(int argc, char** argv) {
 
     if (profile) {
         auto d_queries = std::chrono::duration<double, std::milli>(t_queries - t_start).count();
-        auto d_docs_scan = std::chrono::duration<double, std::milli>(t_docs_scan - t_queries).count();
-        auto d_index = std::chrono::duration<double, std::milli>(t_index - t_docs_scan).count();
-        auto d_query_exec = std::chrono::duration<double, std::milli>(t_queries_done - t_index).count();
+        auto d_pass1 = std::chrono::duration<double, std::milli>(t_pass1 - t_queries).count();
+        auto d_pass2 = std::chrono::duration<double, std::milli>(t_pass2 - t_pass1).count();
+        auto d_query_exec = std::chrono::duration<double, std::milli>(t_queries_done - t_pass2).count();
         auto d_output = std::chrono::duration<double, std::milli>(t_done - t_queries_done).count();
         auto d_total = std::chrono::duration<double, std::milli>(t_done - t_start).count();
 
         std::cerr << "[Profile Breakdown]\n"
                   << "  Query parse:       " << d_queries << " ms\n"
-                  << "  Docs scan (16 th): " << d_docs_scan << " ms\n"
-                  << "  Doc index (16 th): " << d_index << " ms\n"
-                  << "  Query exec (16 th):" << d_query_exec << " ms\n"
+                  << "  Pass 1 (scan & df):" << d_pass1 << " ms\n"
+                  << "  Pass 2 (indexing): " << d_pass2 << " ms\n"
+                  << "  Query exec:        " << d_query_exec << " ms\n"
                   << "  Output write:      " << d_output << " ms\n"
-                  << "  Total wall:        " << d_total << " ms\n";
+                  << "  Total wall:        " << d_total << " ms\n"
+                  << "  Dense terms:       " << num_dense_terms << " ("
+                  << (num_dense_terms * num_words * 8) / (1024.0 * 1024.0) << " MB)\n"
+                  << "  Sparse postings:   " << total_sparse_postings << " ("
+                  << (total_sparse_postings * 4) / (1024.0 * 1024.0) << " MB)\n";
     }
 
-    free(bitsets);
+    if (dense_bitsets) free(dense_bitsets);
+    if (sparse_postings) free(sparse_postings);
     return 0;
 }

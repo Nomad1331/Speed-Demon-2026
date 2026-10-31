@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged (Python 3.13) | local-ref | 2.193 | 344 | 0 |
-| 1 | C++20 zero-copy memory-mapped query-directed inverted index, 16-thread persistent barrier pipeline, 64-aligned word bitset partitioning (zero contention), open-addressing term table, AVX2 bitwise accumulator, 16-bit popcount/sum LUT, on-the-fly candidate phrase verification, LUT integer formatter | local-cpp-v1 | 0.025 | 36 | 95.8 |
+| 1 | Full-dense C++20 bitsets (all 60k query terms allocate 31KB bitsets) | board-run-1 | 0.752 | 2,405 | 39.96 |
+| 2 | Sparse/Dense Hybrid Posting Lists: rare terms (df < threshold) stored as compact sorted uint32_t arrays, dense bitsets only for df >= threshold. AVX2 bitwise accumulator for dense terms, direct bit testing for sparse terms. RAM squeezed from 2.4 GB down to ~34 MB (<40 MB). | local-cpp-v2 | 0.032 | 34 | 78.4 |
