@@ -136,7 +136,7 @@ struct DynamicHashSet {
     uint32_t cap = 0;
     uint32_t count = 0;
 
-    void init(uint32_t initial_cap = 4096) {
+    void init(uint32_t initial_cap = 64) {
         cap = initial_cap;
         count = 0;
         entries = (uint64_t*)calloc(cap, sizeof(uint64_t));
@@ -163,7 +163,9 @@ struct DynamicHashSet {
 
     inline void insert(uint64_t val) {
         if (val == 0) val = 1;
-        if (count * 2 >= cap) {
+        if (cap == 0) {
+            init(64);
+        } else if (count * 2 >= cap) {
             grow();
         }
         uint32_t mask = cap - 1;
@@ -177,7 +179,7 @@ struct DynamicHashSet {
     }
 
     void grow() {
-        uint32_t new_cap = cap * 2;
+        uint32_t new_cap = (cap == 0) ? 64 : cap * 2;
         uint64_t* new_entries = (uint64_t*)calloc(new_cap, sizeof(uint64_t));
         uint32_t mask = new_cap - 1;
         for (uint32_t i = 0; i < cap; ++i) {
@@ -204,7 +206,7 @@ struct LocalCountryAgg {
     int64_t amount_max = 0;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
-    uint32_t names_count = 0;
+    DynamicHashSet names;
 };
 
 struct MergedCountryAgg {
@@ -226,19 +228,9 @@ struct Chunk {
     const char* end = nullptr;
 };
 
-static constexpr size_t LOCAL_HASH_CAP = 2048;
-static constexpr size_t LOCAL_HASH_MASK = LOCAL_HASH_CAP - 1;
-
 struct ThreadData {
     std::vector<LocalCountryAgg> local_countries;
-    uint64_t* name_table_pool = nullptr;
-    uint64_t* name_entries_pool = nullptr;
     std::string out_buf;
-
-    ~ThreadData() {
-        if (name_table_pool) free(name_table_pool);
-        if (name_entries_pool) free(name_entries_pool);
-    }
 };
 
 struct RegionRecord {
@@ -408,8 +400,6 @@ int main(int argc, char* argv[]) {
     std::vector<ThreadData> tdata(nthreads);
     for (unsigned int t = 0; t < nthreads; ++t) {
         tdata[t].local_countries.resize(num_countries + 1);
-        tdata[t].name_table_pool = (uint64_t*)calloc((num_countries + 1) * LOCAL_HASH_CAP, sizeof(uint64_t));
-        tdata[t].name_entries_pool = (uint64_t*)malloc((num_countries + 1) * LOCAL_HASH_CAP * sizeof(uint64_t));
     }
 
     std::vector<MergedCountryAgg> merged_countries(num_countries + 1);
@@ -420,8 +410,6 @@ int main(int argc, char* argv[]) {
         const char* ptr = chunks[t].start;
         const char* chunk_end = chunks[t].end;
         auto& my_countries = tdata[t].local_countries;
-        uint64_t* name_tbl = tdata[t].name_table_pool;
-        uint64_t* name_ent = tdata[t].name_entries_pool;
 
         while (ptr < chunk_end) {
             // Optional BOM at record start
@@ -530,16 +518,7 @@ int main(int argc, char* argv[]) {
             agg.note_bytes += note_len;
 
             // Insert name_hash into local country hash table
-            uint64_t val = (name_hash == 0) ? 1 : name_hash;
-            uint64_t* tbl = name_tbl + (size_t)cid * LOCAL_HASH_CAP;
-            uint32_t idx = (uint32_t)(val ^ (val >> 32)) & LOCAL_HASH_MASK;
-            while (tbl[idx] != 0) {
-                if (tbl[idx] == val) goto name_inserted;
-                idx = (idx + 1) & LOCAL_HASH_MASK;
-            }
-            tbl[idx] = val;
-            name_ent[(size_t)cid * LOCAL_HASH_CAP + agg.names_count++] = val;
-            name_inserted: ;
+            agg.names.insert(name_hash);
         }
 
         sync_point.arrive_and_wait();
@@ -575,9 +554,12 @@ int main(int argc, char* argv[]) {
                     merged.name_bytes += other.name_bytes;
                     merged.note_bytes += other.note_bytes;
                 }
-                const uint64_t* ent = tdata[ot].name_entries_pool + (size_t)c * LOCAL_HASH_CAP;
-                for (uint32_t k = 0; k < other.names_count; ++k) {
-                    merged.names.insert(ent[k]);
+                if (other.names.entries) {
+                    for (uint32_t k = 0; k < other.names.cap; ++k) {
+                        if (other.names.entries[k] != 0) {
+                            merged.names.insert(other.names.entries[k]);
+                        }
+                    }
                 }
             }
         }
