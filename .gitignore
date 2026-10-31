@@ -1,2 +1,7 @@
 .out/
 data/
+speed-demon-2026/
+toolchain/
+*.exe
+*.o
+*.obj
