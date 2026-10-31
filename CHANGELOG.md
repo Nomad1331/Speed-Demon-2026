@@ -1,5 +1,23 @@
 # Speed Demon 2026 — Engineering Changelog
 
+## [0.3.0] - 2026-11-01
+### Added
+- High-performance zero-dependency C++20 engine in `track-c/main.cpp` for Track C (Join).
+- Memory-mapped zero-copy file streaming for `records.csv` and `regions.csv` with `MapViewOfFile` / `mmap`.
+- Single-pass `regions.csv` parsing with zero-allocation BSS direct lookup table `region_to_country[10000000]`, using `0` for `_UNMATCHED` and `1..num_countries` for sorted country codes.
+- Parallel CRLF record-boundary chunking with `std::barrier`, safely splitting hostile CSV files across 16 threads without quote-boundary corruption.
+- Single-pass on-the-fly unescaping, byte length accumulation, and 64-bit FNV-1a hashing for quoted/unquoted `name` and `note` fields with zero intermediate string allocations.
+- Full compliance with UTF-8 BOM (`\xef\xbb\xbf`) detection at file start and mid-file boundaries after both CRLF and LF terminators.
+- Exact signed integer cents arithmetic (`cents = whole * 100 + frac`) without floating-point math.
+- Pre-allocated 2048-slot contiguous hash pool per thread and compact unique key tracking for fast lock-free country reduction.
+- Fast LUT-based integer and signed decimal cents formatter.
+- Allowlisted two-stage Dockerfile (`gcc:16` build stage, `debian:13-slim` runtime stage) and `.speed-demon.toml` configured with `team = "Nomad Labs"`, `language = "C++"`, `dependency_count = 0`, validated against `dockerfile_check.py`.
+### Verified
+- Exact SHA-256 match on `data/c_tiny`: `E4E43BC39920E9D446C3FCD700FDD35B3959E9495C6AAA738491DF38A1AED733`.
+- Exact SHA-256 match on `data/c_sample`: `9035FED36823232DD41AE2D1B9D6D21AA7C73F49D8E95647E953A89D5EBE9A66`.
+- Verified on all test suites and hand-crafted edge cases: `WORKED_RECORDS`, `RULES_RECORDS` (leading BOM, final LF, final CRLF), and `test_c_*.py` (14/14 tests pass).
+- Achieved **33.45 ms** execution time on `data/c_sample` (35.3x speedup over Python reference baseline 1,181 ms; 40.8x vs measured Python).
+
 ## [0.2.0] - 2026-11-01
 ### Added
 - High-performance zero-dependency C++20 engine in `track-a/main.cpp` for Track A (Ingest).
