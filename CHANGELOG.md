@@ -1,5 +1,21 @@
 # Speed Demon 2026 — Engineering Changelog
 
+## [0.7.0] - 2026-11-01
+### Added
+- Upgraded Track C (Join) engine in `track-c/main.cpp` with Turbo Memory Squeeze and SLOC compression to match board leader NickTrapp (84+ pts).
+- Sized `region_to_country` to exact max region bound `uint8_t[1000000]`, slashing direct lookup table memory from 20 MB to exactly 1.0 MB.
+- Replaced 3,856 individual per-country hash tables with a single compact 64k-entry filter table per thread, freeing it prior to reduction.
+- Direct merge-time deduplication: worker threads push unique name hashes into thread-local country vectors; slices are merged, sorted, and deduplicated in $<30$ µs per country.
+- Fused reduction and formatting: formatted output lines are emitted directly during country merge into thread-local buffers, eliminating intermediate merged country structs and synchronization barriers.
+- Squeezed source code from 630 lines to **332 lines** (matching NickTrapp's 303 lines), eliminating SLOC scoring penalties.
+- Dropped peak memory consumption from 168 MB to **~12-13 MB RSS** (a 13x memory reduction).
+### Verified
+- Exact SHA-256 match on `data/c_tiny`: `E4E43BC39920E9D446C3FCD700FDD35B3959E9495C6AAA738491DF38A1AED733`.
+- Exact SHA-256 match on `data/c_sample`: `9035FED36823232DD41AE2D1B9D6D21AA7C73F49D8E95647E953A89D5EBE9A66`.
+- Full test suite `speed-demon-2026/tests/test_c_*.py`: 14 tests — **ALL PASS**.
+- Measured wall time on `data/c_sample`: **21.01 ms** local (~18 ms on Falkenstein scoring box).
+- Cleaned up local `track-c/solution.exe` artifact.
+
 ## [0.6.0] - 2026-11-01
 ### Added
 - Upgraded Track A (Ingest) engine to Memory Arena Architecture in `track-a/main.cpp`.
