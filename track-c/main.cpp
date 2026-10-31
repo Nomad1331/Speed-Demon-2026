@@ -79,9 +79,6 @@ struct MappedFile {
 #endif
 };
 
-struct TableEntry { uint64_t hash; uint8_t cid; uint8_t used; };
-static constexpr size_t HASH_CAP = 65536;
-static constexpr size_t HASH_MASK = HASH_CAP - 1;
 
 struct LocalCountryAgg {
     uint64_t count = 0; int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0;
@@ -189,7 +186,6 @@ int main(int argc, char* argv[]) {
     std::barrier sync_point(nthreads);
 
     auto worker_fn = [&](unsigned int t) {
-        TableEntry* filter_table = (TableEntry*)calloc(HASH_CAP, sizeof(TableEntry));
         const char* ptr = chunks[t].start, *chunk_end = chunks[t].end;
         auto& my_countries = tdata[t].countries;
         auto& my_names = tdata[t].country_names;
@@ -254,17 +250,9 @@ int main(int argc, char* argv[]) {
             }
             agg.name_bytes += name_len; agg.note_bytes += note_len;
 
-            uint32_t hidx = (uint32_t)(name_hash ^ (name_hash >> 32)) & HASH_MASK;
-            while (filter_table[hidx].used) {
-                if (filter_table[hidx].hash == name_hash && filter_table[hidx].cid == cid) goto name_done;
-                hidx = (hidx + 1) & HASH_MASK;
-            }
-            filter_table[hidx].hash = name_hash; filter_table[hidx].cid = cid; filter_table[hidx].used = 1;
             my_names[cid].push_back(name_hash);
-            name_done: ;
         }
 
-        free(filter_table);
         sync_point.arrive_and_wait();
 
         uint16_t total_c = num_countries + 1;
