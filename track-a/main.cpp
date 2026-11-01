@@ -10,7 +10,6 @@
 #include <immintrin.h>
 #include <atomic>
 #include <memory>
-
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -23,7 +22,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-
 static const char DIGITS_LUT[] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) { *p++ = (char)('0' + val); return p; }
@@ -81,6 +79,14 @@ inline const char* find_char_avx2(const char* cur, const char* end, __m256i tgt)
     while (cur < end && *cur != CH) ++cur; return cur;
 }
 
+inline uint64_t hash_endpoint(const char* s, size_t len) {
+    uint64_t h = len * 11400714819323198485ULL;
+    const char* end = s + len;
+    while (s + 8 <= end) { uint64_t v; memcpy(&v, s, 8); h = _mm_crc32_u64(h, v); s += 8; }
+    while (s < end) h = _mm_crc32_u64(h, (uint8_t)*s++);
+    return h;
+}
+
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
 struct EpEntry { uint64_t hash = 0; uint16_t len = 0, local_id = 0, global_id = 0; };
 struct EndpointTable {
@@ -126,17 +132,10 @@ int main(int argc, char* argv[]) {
     std::filesystem::create_directories(out_dir);
     MappedFile mf;
     if (!mf.open(in_path.string()) || mf.size == 0) { FILE* f = fopen(out_path.string().c_str(), "wb"); if (f) fclose(f); return 0; }
-
     static const size_t H = 72;
     std::string hour_strings[H];
-    {
-        size_t idx = 0;
-        auto add_h = [&](const char* pr, int s, int e) {
-            for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; }
-        };
-        add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17);
-    }
-
+    { size_t idx = 0; auto add_h = [&](const char* pr, int s, int e) { for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; } };
+      add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17); }
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf.size < 100000) nthreads = 1;
     struct Chunk { size_t start = 0, end = 0; };
@@ -157,22 +156,22 @@ int main(int argc, char* argv[]) {
     auto worker_fn = [&](unsigned int t) {
         auto& td = tdata[t];
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
-        char last_hour[13] = {0}; int last_hid = -1;
+        uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' '), nl = _mm256_set1_epi8('\n');
         uintptr_t last_evict = (uintptr_t)p & ~4095ULL;
         // Pass 1: AVX2 scanning of method, endpoint, status, and sliding madvise
         while (p < end) {
             if (p + 27 > end) break;
-            int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
-            if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
+            uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
+            int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
+            if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
             const char* cur = p + 28;
             int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
             const char* ep_start = cur;
             cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint64_t ep_hash = 14695981039346656037ULL;
-            for (const char* k = ep_start; k < cur; ++k) ep_hash = (ep_hash ^ (uint8_t)*k) * 1099511628211ULL;
+            uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
             uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
             size_t idx = (size_t)hid * MAX_EP + ep_id;
             td.counts[idx]++;
@@ -231,23 +230,24 @@ int main(int argc, char* argv[]) {
         td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
         sync_point.arrive_and_wait();
         // Pass 2: AVX2 scanning and streaming latencies into flat all_latencies array
-        p = mf.data + chunks[t].start; last_hid = -1;
+        p = mf.data + chunks[t].start; last_hid = -1; last_tag = 0;
         last_evict = (uintptr_t)p & ~4095ULL;
         while (p < end) {
             if (p + 27 > end) break;
-            int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
-            if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
+            uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
+            int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
+            if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
             const char* cur = p + 28;
             int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
             const char* ep_start = cur;
             cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint64_t ep_hash = 14695981039346656037ULL;
-            for (const char* k = ep_start; k < cur; ++k) ep_hash = (ep_hash ^ (uint8_t)*k) * 1099511628211ULL;
+            uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
             uint16_t gep = td.ep_table.lookup(ep_len, ep_hash);
-            cur += 5; uint32_t lat = 0;
-            while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
+            cur += 5;
+            uint32_t lat = (uint8_t)(*cur++ - '0');
+            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
             size_t ggid = (size_t)hid * N + gep;
             uint32_t pos = atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed);
             all_latencies[pos] = lat;

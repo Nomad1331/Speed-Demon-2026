@@ -135,10 +135,12 @@ static void init_lut16() {
     }
 }
 
-inline uint64_t fnv1a(const char* s, size_t len) {
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) h = (h ^ (unsigned char)s[i]) * 1099511628211ULL;
-    return h;
+alignas(64) static uint64_t FILTER_BITMAP[16384];
+
+inline uint32_t compute_crc(const char* s, uint32_t len) {
+    uint32_t c = 0;
+    for (uint32_t i = 0; i < len; ++i) c = _mm_crc32_u8(c, (uint8_t)s[i]);
+    return c;
 }
 
 inline bool tokens_equal(const char* query_str, const char* doc_tok, uint32_t len) {
@@ -149,9 +151,7 @@ inline bool tokens_equal(const char* query_str, const char* doc_tok, uint32_t le
 }
 
 struct TermSlot {
-    uint64_t hash = 0;
-    uint32_t term_id = 0;
-    uint32_t len = 0;
+    uint32_t hash = 0, term_id = 0, len = 0;
     const char* str = nullptr;
 };
 
@@ -169,31 +169,64 @@ struct TermTable {
     }
     ~TermTable() { if (slots) free(slots); }
 
-    uint32_t get_or_insert(const char* s, uint32_t len) {
-        uint64_t h = fnv1a(s, len);
-        uint32_t idx = (uint32_t)(h & mask);
-        while (slots[idx].hash != 0) {
-            if (slots[idx].hash == h && slots[idx].len == len && memcmp(slots[idx].str, s, len) == 0)
+    uint32_t get_or_insert(const char* s, uint32_t len, uint32_t crc) {
+        uint32_t idx = crc & mask;
+        while (slots[idx].str != nullptr) {
+            if (slots[idx].hash == crc && slots[idx].len == len && memcmp(slots[idx].str, s, len) == 0)
                 return slots[idx].term_id;
             idx = (idx + 1) & mask;
         }
         uint32_t id = num_terms++;
-        slots[idx].hash = h; slots[idx].len = len; slots[idx].str = s;
+        slots[idx].hash = crc; slots[idx].len = len; slots[idx].str = s;
         slots[idx].term_id = id;
         term_strings.push_back(std::string_view(s, len));
         return id;
     }
 
-    inline uint32_t lookup(uint64_t h, const char* s, uint32_t len) const {
-        uint32_t idx = (uint32_t)(h & mask);
-        while (slots[idx].hash != 0) {
-            if (slots[idx].hash == h && slots[idx].len == len && tokens_equal(slots[idx].str, s, len))
+    inline uint32_t lookup(uint32_t crc, const char* s, uint32_t len) const {
+        uint32_t idx = crc & mask;
+        while (slots[idx].str != nullptr) {
+            if (slots[idx].hash == crc && slots[idx].len == len && tokens_equal(slots[idx].str, s, len))
                 return slots[idx].term_id;
             idx = (idx + 1) & mask;
         }
         return UINT32_MAX;
     }
 };
+
+inline uint32_t extract_doc_terms(const char* dp, const char* text_end, const TermTable& term_table, uint32_t* doc_terms_buf) {
+    uint32_t num_doc_terms = 0;
+    while (dp < text_end) {
+        uint8_t c = CHAR_MAP[(unsigned char)*dp++];
+        if (!c) continue;
+
+        const char* tok_start = dp - 1;
+        uint32_t crc = _mm_crc32_u8(0, c);
+
+        while (dp < text_end) {
+            c = CHAR_MAP[(unsigned char)*dp];
+            if (!c) break;
+            crc = _mm_crc32_u8(crc, c);
+            dp++;
+        }
+        uint32_t tok_len = (uint32_t)(dp - tok_start);
+
+        uint32_t b1 = crc & 0xFFFFF;
+        if (!((FILTER_BITMAP[b1 >> 6] >> (b1 & 63)) & 1ULL)) continue;
+        uint32_t b2 = (crc * 0x9E3779B1u) & 0xFFFFF;
+        if (!((FILTER_BITMAP[b2 >> 6] >> (b2 & 63)) & 1ULL)) continue;
+
+        uint32_t term_id = term_table.lookup(crc, tok_start, tok_len);
+        if (term_id != UINT32_MAX && num_doc_terms < 1024) {
+            doc_terms_buf[num_doc_terms++] = term_id;
+        }
+    }
+    if (num_doc_terms > 0) {
+        std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
+        return (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
+    }
+    return 0;
+}
 
 enum class QueryType : uint8_t { BOOL_QUERY, PHRASE_QUERY };
 enum class BoolOp : uint8_t { AND = 1, OR = 2, NOT = 3 };
@@ -270,6 +303,15 @@ int main(int argc, char** argv) {
     const char* qp = queries_file.data;
     const char* qend = queries_file.data + queries_file.size;
 
+    auto register_term = [&](std::string_view tok) -> uint32_t {
+        uint32_t crc = compute_crc(tok.data(), (uint32_t)tok.size());
+        uint32_t tid = term_table.get_or_insert(tok.data(), (uint32_t)tok.size(), crc);
+        uint32_t b1 = crc & 0xFFFFF, b2 = (crc * 0x9E3779B1u) & 0xFFFFF;
+        FILTER_BITMAP[b1 >> 6] |= (1ULL << (b1 & 63));
+        FILTER_BITMAP[b2 >> 6] |= (1ULL << (b2 & 63));
+        return tid;
+    };
+
     while (qp < qend) {
         const char* line_start = qp;
         while (qp < qend && *qp != '\n') qp++;
@@ -291,8 +333,7 @@ int main(int argc, char** argv) {
                 std::string_view tok(tok_start, (size_t)(cur - tok_start));
                 if (cur < line_end && *cur == ' ') cur++;
                 if ((pos % 2) == 0) {
-                    uint32_t tid = term_table.get_or_insert(tok.data(), (uint32_t)tok.size());
-                    q.b.term_ids[q.b.num_terms++] = tid;
+                    q.b.term_ids[q.b.num_terms++] = register_term(tok);
                 } else {
                     if (tok == "AND") q.b.ops[q.b.num_terms - 1] = BoolOp::AND;
                     else if (tok == "OR") q.b.ops[q.b.num_terms - 1] = BoolOp::OR;
@@ -312,7 +353,7 @@ int main(int argc, char** argv) {
                 while (cur < p_term_end && *cur != ' ') cur++;
                 std::string_view tok(tok_start, (size_t)(cur - tok_start));
                 if (cur < p_term_end && *cur == ' ') cur++;
-                uint32_t tid = term_table.get_or_insert(tok.data(), (uint32_t)tok.size());
+                uint32_t tid = register_term(tok);
                 q.p.term_ids[q.p.num_terms] = tid;
                 q.p.terms[q.p.num_terms] = term_table.term_strings[tid];
                 q.p.num_terms++;
@@ -412,38 +453,8 @@ int main(int argc, char** argv) {
                     doc_lens[doc_id] = (uint32_t)(text_end - text_start);
                 }
 
-                // In-line tokenization on hot L1/L2 cache
-                const char* dp = text_start;
-                uint32_t num_doc_terms = 0;
-                while (dp < text_end) {
-                    uint8_t c = CHAR_MAP[(unsigned char)*dp++];
-                    if (!c) continue;
-
-                    uint64_t hash = 14695981039346656037ULL;
-                    const char* tok_start = dp - 1;
-                    hash = (hash ^ c) * 1099511628211ULL;
-
-                    while (dp < text_end) {
-                        c = CHAR_MAP[(unsigned char)*dp];
-                        if (!c) break;
-                        hash = (hash ^ c) * 1099511628211ULL;
-                        dp++;
-                    }
-                    uint32_t tok_len = (uint32_t)(dp - tok_start);
-                    uint32_t term_id = term_table.lookup(hash, tok_start, tok_len);
-                    if (term_id != UINT32_MAX && num_doc_terms < 1024) {
-                        doc_terms_buf[num_doc_terms++] = term_id;
-                    }
-                }
-
-                if (num_doc_terms > 0) {
-                    std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
-                    uint32_t unique_count = (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
-                    for (uint32_t j = 0; j < unique_count; ++j) {
-                        my_df[doc_terms_buf[j]]++;
-                    }
-                }
-
+                uint32_t unique_count = extract_doc_terms(text_start, text_end, term_table, doc_terms_buf);
+                for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
                 p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
             }
 
@@ -493,42 +504,16 @@ int main(int argc, char** argv) {
             for (size_t d = d_start; d < d_end; ++d) {
                 const char* dp = docs_file.data + doc_offsets[d];
                 const char* text_end = dp + doc_lens[d];
-                uint32_t num_doc_terms = 0;
                 size_t word_idx = d >> 6;
                 uint64_t bit_mask = 1ULL << (d & 63);
-
-                while (dp < text_end) {
-                    uint8_t c = CHAR_MAP[(unsigned char)*dp++];
-                    if (!c) continue;
-
-                    uint64_t hash = 14695981039346656037ULL;
-                    const char* tok_start = dp - 1;
-                    hash = (hash ^ c) * 1099511628211ULL;
-
-                    while (dp < text_end) {
-                        c = CHAR_MAP[(unsigned char)*dp];
-                        if (!c) break;
-                        hash = (hash ^ c) * 1099511628211ULL;
-                        dp++;
-                    }
-                    uint32_t tok_len = (uint32_t)(dp - tok_start);
-                    uint32_t term_id = term_table.lookup(hash, tok_start, tok_len);
-                    if (term_id != UINT32_MAX && num_doc_terms < 1024) {
-                        doc_terms_buf[num_doc_terms++] = term_id;
-                    }
-                }
-
-                if (num_doc_terms > 0) {
-                    std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
-                    uint32_t unique_count = (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
-                    for (uint32_t j = 0; j < unique_count; ++j) {
-                        uint32_t term_id = doc_terms_buf[j];
-                        const TermInfo& ti = terms[term_id];
-                        if (ti.dense_idx != UINT32_MAX) {
-                            __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
-                        } else {
-                            sparse_postings[my_write_offsets[term_id]++] = (uint32_t)d;
-                        }
+                uint32_t unique_count = extract_doc_terms(dp, text_end, term_table, doc_terms_buf);
+                for (uint32_t j = 0; j < unique_count; ++j) {
+                    uint32_t term_id = doc_terms_buf[j];
+                    const TermInfo& ti = terms[term_id];
+                    if (ti.dense_idx != UINT32_MAX) {
+                        __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
+                    } else {
+                        sparse_postings[my_write_offsets[term_id]++] = (uint32_t)d;
                     }
                 }
 

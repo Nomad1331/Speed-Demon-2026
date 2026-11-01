@@ -162,10 +162,6 @@ int main(int argc, char* argv[]) {
                 if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
 #endif
                 last_evicted = ptr;
-                for (uint16_t c = 0; c <= num_countries; ++c) {
-                    auto& v = my_names[c];
-                    if (v.size() > 64) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); }
-                }
             }
             if (ptr + 3 <= chunk_end && (uint8_t)ptr[0] == 0xef && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
 
