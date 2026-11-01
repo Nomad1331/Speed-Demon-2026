@@ -7,6 +7,7 @@
 #include <immintrin.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -26,7 +27,7 @@ inline char* write_u64(char* p, uint64_t v) {
     char buf[24], *b = buf + 24;
     while (v >= 100) {
         uint64_t q = v / 100; uint32_t r = (uint32_t)(v - q * 100);
-        v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
+        val_assign: v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
     }
     if (v < 10) *--b = '0' + v;
     else { b -= 2; memcpy(b, &DIGITS_LUT[v * 2], 2); }
@@ -44,7 +45,8 @@ struct MappedFile {
     const char* data = nullptr; size_t size = 0; int fd = -1;
     bool open(const std::string& path) {
         fd = ::open(path.c_str(), O_RDONLY | O_BINARY); if (fd < 0) return false;
-        struct stat st; fstat(fd, &st); size = (size_t)st.st_size; if (!size) return true;
+        struct stat st; if (fstat(fd, &st) < 0) { ::close(fd); fd = -1; return false; }
+        size = (size_t)st.st_size; if (!size) return true;
         data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0); return data != MAP_FAILED;
     }
     void close() {
@@ -54,17 +56,13 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-struct alignas(8) NameNode {
-    uint64_t hash = 0;
-    uint32_t next = 0;
+struct alignas(8) NameSlot {
+    std::atomic<uint64_t> hash{0};
     std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
 };
 
-static constexpr size_t BUCKETS_CAP = 1 << 17;
-static constexpr size_t BUCKETS_MASK = BUCKETS_CAP - 1;
-static std::atomic<uint32_t> bucket_heads[BUCKETS_CAP];
-static NameNode nodes_pool[262144];
-static std::atomic<uint32_t> node_alloc_ptr{1};
+static constexpr size_t HASH_CAP = 1 << 18;
+static constexpr size_t HASH_MASK = HASH_CAP - 1;
 
 struct LocalCountryAgg {
     uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
@@ -78,17 +76,12 @@ static uint8_t region_to_country[1000000];
 struct Chunk { const char* start = nullptr; const char* end = nullptr; };
 
 int main(int argc, char* argv[]) {
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+
     std::string data_dir = "/data", out_arg = "/out";
     for (int i = 1; i < argc; ++i) {
-        std::string_view arg = argv[i];
-        if (arg == "--data" && i + 1 < argc) data_dir = argv[++i];
-        else if (arg.starts_with("--data=")) data_dir = arg.substr(7);
-        else if (arg == "--out" && i + 1 < argc) out_arg = argv[++i];
-        else if (arg.starts_with("--out=")) out_arg = arg.substr(6);
-        else if (arg[0] != '-') {
-            if (data_dir == "/data") data_dir = argv[i];
-            else if (out_arg == "/out") out_arg = argv[i];
-        }
+        if (!strcmp(argv[i], "--data") && i + 1 < argc) data_dir = argv[++i];
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_arg = argv[++i];
     }
     std::filesystem::path out_path = out_arg.ends_with(".txt") ? std::filesystem::path(out_arg) : std::filesystem::path(out_arg) / "aggregates.txt";
     std::filesystem::create_directories(out_path.parent_path());
@@ -114,25 +107,26 @@ int main(int argc, char* argv[]) {
         if (p < rend && *p == '\n') p++;
     }
     std::sort(unique_codes, unique_codes + num_countries);
-    std::string country_names[241]; country_names[0] = "_UNMATCHED";
-    uint8_t code_to_cid[26 * 26 * 26] = {0};
+    uint8_t pack_to_id[26 * 26 * 26]; memset(pack_to_id, 0, sizeof(pack_to_id));
     for (uint16_t i = 0; i < num_countries; ++i) {
-        uint32_t cd = unique_codes[i];
-        country_names[i + 1] = std::string({(char)(cd >> 16), (char)((cd >> 8) & 0xFF), (char)(cd & 0xFF)});
-        code_to_cid[(uint16_t)((((cd >> 16) - 'A') * 26 + (((cd >> 8) & 0xFF) - 'A')) * 26 + ((cd & 0xFF) - 'A'))] = (uint8_t)(i + 1);
+        uint32_t c = unique_codes[i];
+        uint16_t pack = (uint16_t)((((c >> 16) & 0xff) - 'A') * 26 * 26 + (((c >> 8) & 0xff) - 'A') * 26 + ((c & 0xff) - 'A'));
+        pack_to_id[pack] = (uint8_t)(i + 1);
     }
     p = rptr;
     while (p < rend) {
-        uint32_t rid = (uint8_t)(*p++ - '0');
-        while ((uint8_t)(*p - '0') <= 9) rid = rid * 10 + (uint8_t)(*p++ - '0');
-        if (p >= rend) break;
+        uint32_t id = (uint8_t)(*p++ - '0');
+        while ((uint8_t)(*p - '0') <= 9) id = id * 10 + (uint8_t)(*p++ - '0');
         p++;
         uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
-        if (rid < 1000000) region_to_country[rid] = code_to_cid[pack];
+        if (id < 1000000) region_to_country[id] = pack_to_id[pack];
         p += 3; while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
     }
     mf_regions.close();
+
+    NameSlot* name_table = (NameSlot*)::mmap(NULL, sizeof(NameSlot) * HASH_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (name_table == MAP_FAILED) return 1;
 
     MappedFile mf_records;
     if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
@@ -142,7 +136,7 @@ int main(int argc, char* argv[]) {
     while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
     if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
 
-    unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
+    unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf_records.size < 200000) nthreads = 1;
     Chunk chunks[16]; chunks[0].start = ptr0;
     if (nthreads == 1) chunks[0].end = file_end;
@@ -284,84 +278,67 @@ int main(int argc, char* argv[]) {
             agg.name_bytes += name_len; agg.note_bytes += note_len;
 
             uint64_t nh = name_hash ? name_hash : 1;
-            uint32_t b_idx = (uint32_t)((nh ^ (nh >> 16)) & BUCKETS_MASK);
-            uint32_t curr = bucket_heads[b_idx].load(std::memory_order_acquire);
-            NameNode* entry = nullptr;
-
-            while (curr != 0) {
-                if (nodes_pool[curr].hash == nh) { entry = &nodes_pool[curr]; break; }
-                curr = nodes_pool[curr].next;
-            }
-
-            if (!entry) {
-                uint32_t new_node = node_alloc_ptr.fetch_add(1, std::memory_order_relaxed);
-                nodes_pool[new_node].hash = nh;
-                curr = bucket_heads[b_idx].load(std::memory_order_relaxed);
-                while (true) {
-                    nodes_pool[new_node].next = curr;
-                    if (bucket_heads[b_idx].compare_exchange_weak(curr, new_node, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                        entry = &nodes_pool[new_node];
-                        break;
+            size_t idx = (nh ^ (nh >> 16)) & HASH_MASK;
+            NameSlot* entry = nullptr;
+            while (true) {
+                uint64_t cur = name_table[idx].hash.load(std::memory_order_relaxed);
+                if (cur == nh) { entry = &name_table[idx]; break; }
+                if (cur == 0) {
+                    uint64_t expected = 0;
+                    if (name_table[idx].hash.compare_exchange_strong(expected, nh, std::memory_order_relaxed)) {
+                        entry = &name_table[idx]; break;
                     }
-                    // If another thread inserted the same hash while we were allocating:
-                    uint32_t chk = curr;
-                    while (chk != 0) {
-                        if (nodes_pool[chk].hash == nh) { entry = &nodes_pool[chk]; break; }
-                        chk = nodes_pool[chk].next;
-                    }
-                    if (entry) break;
+                    if (expected == nh) { entry = &name_table[idx]; break; }
                 }
+                idx = (idx + 1) & HASH_MASK;
             }
-
-            uint32_t word = cid >> 6;
-            uint64_t mask = 1ULL << (cid & 63);
-            uint64_t cur_bits = entry->seen[word].load(std::memory_order_relaxed);
-            if (__builtin_expect(!(cur_bits & mask), 0)) {
-                if (!(entry->seen[word].fetch_or(mask, std::memory_order_relaxed) & mask)) {
-                    agg.distinct_names++;
-                }
+            uint32_t w = cid >> 6;
+            uint64_t bit = 1ULL << (cid & 63);
+            if (!(entry->seen[w].fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                agg.distinct_names++;
             }
         }
     };
 
-    std::vector<std::thread> workers; workers.reserve(nthreads - 1);
-    for (unsigned int t = 1; t < nthreads; ++t) workers.emplace_back(worker_fn, t);
-    worker_fn(0);
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (unsigned int i = 0; i < nthreads; ++i) workers.emplace_back(worker_fn, i);
     for (auto& w : workers) w.join();
-    mf_records.close();
 
-    char out_buf[65536]; char* p_out = out_buf;
-    for (uint16_t idx = 0; idx <= num_countries; ++idx) {
-        uint8_t c = out_order[idx];
-        uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
-        int64_t amt_sum = 0, amt_min = INT64_MAX, amt_max = INT64_MIN;
-        uint32_t distinct_names = 0;
-        for (unsigned int ot = 0; ot < nthreads; ++ot) {
-            const auto& o = tdata[ot].countries[c];
-            if (!o.count) continue;
-            count += o.count; id_sum += o.id_sum; amt_sum += o.amount_sum;
-            amt_min = std::min(amt_min, o.amount_min); amt_max = std::max(amt_max, o.amount_max);
-            name_bytes += o.name_bytes; note_bytes += o.note_bytes;
-            distinct_names += o.distinct_names;
+    FILE* fp = fopen(out_path.string().c_str(), "wb");
+    if (!fp) return 1;
+    char out_buf[1024];
+    for (uint16_t i = 0; i <= num_countries; ++i) {
+        uint8_t cid = out_order[i];
+        LocalCountryAgg total;
+        bool any = false;
+        for (unsigned int t = 0; t < nthreads; ++t) {
+            const auto& src = tdata[t].countries[cid];
+            if (src.count > 0) {
+                if (!any) { total.amount_min = src.amount_min; total.amount_max = src.amount_max; any = true; }
+                else { total.amount_min = std::min(total.amount_min, src.amount_min); total.amount_max = std::max(total.amount_max, src.amount_max); }
+                total.count += src.count; total.id_sum += src.id_sum; total.amount_sum += src.amount_sum;
+                total.name_bytes += src.name_bytes; total.note_bytes += src.note_bytes;
+                total.distinct_names += src.distinct_names;
+            }
         }
-        if (!count) continue;
-
-        const std::string& name = country_names[c];
-        memcpy(p_out, name.data(), name.size()); p_out += name.size(); *p_out++ = ' ';
-        p_out = write_u64(p_out, count); *p_out++ = ' ';
-        p_out = write_u64(p_out, id_sum); *p_out++ = ' ';
-        p_out = format_money(p_out, amt_sum); *p_out++ = ' ';
-        p_out = format_money(p_out, amt_min); *p_out++ = ' ';
-        p_out = format_money(p_out, amt_max); *p_out++ = ' ';
-        p_out = write_u64(p_out, distinct_names); *p_out++ = ' ';
-        p_out = write_u64(p_out, name_bytes); *p_out++ = ' ';
-        p_out = write_u64(p_out, note_bytes); *p_out++ = '\n';
+        if (!any) continue;
+        char* cur = out_buf;
+        if (cid == 0) { memcpy(cur, "_UNMATCHED ", 11); cur += 11; }
+        else {
+            uint32_t code = unique_codes[cid - 1];
+            *cur++ = (char)((code >> 16) & 0xff); *cur++ = (char)((code >> 8) & 0xff); *cur++ = (char)(code & 0xff); *cur++ = ' ';
+        }
+        cur = write_u64(cur, total.count); *cur++ = ' ';
+        cur = write_u64(cur, total.id_sum); *cur++ = ' ';
+        cur = format_money(cur, total.amount_sum); *cur++ = ' ';
+        cur = format_money(cur, total.amount_min); *cur++ = ' ';
+        cur = format_money(cur, total.amount_max); *cur++ = ' ';
+        cur = write_u64(cur, total.distinct_names); *cur++ = ' ';
+        cur = write_u64(cur, total.name_bytes); *cur++ = ' ';
+        cur = write_u64(cur, total.note_bytes); *cur++ = '\n';
+        fwrite(out_buf, 1, cur - out_buf, fp);
     }
-
-    FILE* out_file = fopen(out_path.string().c_str(), "wb");
-    if (out_file) {
-        fwrite(out_buf, 1, (size_t)(p_out - out_buf), out_file);
-        fclose(out_file);
-    }
+    fclose(fp);
     _exit(0);
 }
