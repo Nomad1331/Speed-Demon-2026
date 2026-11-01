@@ -84,7 +84,12 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct SharedSlot { std::atomic<uint64_t> hash{0}; uint32_t offset = 0; uint16_t len = 0, id = 0; };
+struct SharedSlot {
+    std::atomic<uint32_t> lock{0};
+    uint64_t hash = 0;
+    uint32_t offset = 0;
+    uint16_t len = 0, id = 0;
+};
 struct SharedEpTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
     SharedSlot slots[CAP];
@@ -92,17 +97,24 @@ struct SharedEpTable {
     inline uint16_t lookup_or_insert(const char* s, uint16_t len, uint64_t h, size_t file_offset) {
         size_t idx = h & MASK;
         while (true) {
-            uint64_t curr = slots[idx].hash.load(std::memory_order_relaxed);
-            if (__builtin_expect(curr == h && slots[idx].len == len, 1)) return slots[idx].id;
-            if (curr == 0) {
-                uint64_t expected = 0;
-                if (slots[idx].hash.compare_exchange_strong(expected, h, std::memory_order_relaxed)) {
+            uint32_t state = slots[idx].lock.load(std::memory_order_acquire);
+            if (state == 2) {
+                if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id;
+            } else if (state == 0) {
+                uint32_t expected = 0;
+                if (slots[idx].lock.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
                     uint16_t id = ep_count.fetch_add(1, std::memory_order_relaxed);
-                    slots[idx].offset = (uint32_t)file_offset; slots[idx].len = len; slots[idx].id = id;
+                    slots[idx].hash = h;
+                    slots[idx].offset = (uint32_t)file_offset;
+                    slots[idx].len = len;
+                    slots[idx].id = id;
+                    slots[idx].lock.store(2, std::memory_order_release);
                     return id;
                 }
-                curr = slots[idx].hash.load(std::memory_order_relaxed);
-                if (curr == h && slots[idx].len == len) return slots[idx].id;
+                continue;
+            } else if (state == 1) {
+                while (slots[idx].lock.load(std::memory_order_acquire) == 1) _mm_pause();
+                if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id;
             }
             idx = (idx + 1) & MASK;
         }
@@ -110,8 +122,7 @@ struct SharedEpTable {
     inline uint16_t lookup(uint16_t len, uint64_t h) const {
         size_t idx = h & MASK;
         while (true) {
-            uint64_t curr = slots[idx].hash.load(std::memory_order_relaxed);
-            if (curr == h && slots[idx].len == len) return slots[idx].id;
+            if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id;
             idx = (idx + 1) & MASK;
         }
     }
@@ -191,7 +202,7 @@ int main(int argc, char* argv[]) {
             struct EpRef { std::string_view sv; uint16_t orig_id; };
             std::vector<EpRef> refs(N);
             for (size_t i = 0; i < SharedEpTable::CAP; ++i) {
-                if (shared_ep.slots[i].hash.load(std::memory_order_relaxed) != 0) {
+                if (shared_ep.slots[i].lock.load(std::memory_order_relaxed) == 2) {
                     uint16_t id = shared_ep.slots[i].id;
                     refs[id] = { std::string_view(mf.data + shared_ep.slots[i].offset, shared_ep.slots[i].len), id };
                 }
