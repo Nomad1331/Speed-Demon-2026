@@ -21,8 +21,7 @@ inline char* write_u64(char* p, uint64_t v) {
     if (v < 10) { *p++ = '0' + v; return p; }
     char buf[24], *b = buf + 24;
     while (v >= 100) {
-        uint64_t q = v / 100;
-        uint32_t r = (uint32_t)(v - q * 100);
+        uint64_t q = v / 100; uint32_t r = (uint32_t)(v - q * 100);
         v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
     }
     if (v < 10) *--b = '0' + v;
@@ -56,7 +55,7 @@ struct alignas(8) NameSlot {
     std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
 };
 
-static constexpr size_t HASH_CAP = 1 << 17;
+static constexpr size_t HASH_CAP = 1 << 18;
 static constexpr size_t HASH_MASK = HASH_CAP - 1;
 
 struct LocalCountryAgg {
@@ -122,9 +121,11 @@ int main(int argc, char* argv[]) {
 
     NameSlot* name_table = (NameSlot*)::mmap(NULL, sizeof(NameSlot) * HASH_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (name_table == MAP_FAILED) return 1;
+    madvise((void*)name_table, sizeof(NameSlot) * HASH_CAP, MADV_WILLNEED);
 
     MappedFile mf_records;
     if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
+    madvise((void*)mf_records.data, mf_records.size, MADV_WILLNEED | MADV_SEQUENTIAL);
     const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
     if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
     while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
@@ -174,6 +175,31 @@ int main(int argc, char* argv[]) {
             uint32_t crc = 0; size_t name_len = 0;
             if (__builtin_expect(*ptr == '"', 1)) {
                 ptr++;
+                if (ptr + 33 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                    if (mask) {
+                        int idx = __builtin_ctz(mask);
+                        if (ptr[idx + 1] == ',') {
+                            name_len = (size_t)idx;
+                            const char* cp = ptr;
+                            while (idx >= 8) {
+                                crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t*)cp);
+                                cp += 8; idx -= 8;
+                            }
+                            if (idx >= 4) {
+                                crc = _mm_crc32_u32(crc, *(const uint32_t*)cp);
+                                cp += 4; idx -= 4;
+                            }
+                            while (idx > 0) {
+                                crc = _mm_crc32_u8(crc, (uint8_t)*cp++);
+                                idx--;
+                            }
+                            ptr += name_len + 2;
+                            goto name_done;
+                        }
+                    }
+                }
                 while (true) {
                     char c = *ptr++;
                     if (__builtin_expect(c != '"', 1)) { crc = _mm_crc32_u8(crc, (uint8_t)c); name_len++; }
@@ -185,11 +211,24 @@ int main(int argc, char* argv[]) {
                 while (*ptr != ',') { crc = _mm_crc32_u8(crc, (uint8_t)*ptr++); name_len++; }
                 ptr++;
             }
+        name_done:
             uint64_t name_hash = ((uint64_t)name_len << 32) | crc;
 
             size_t note_len = 0;
             if (__builtin_expect(*ptr == '"', 1)) {
                 ptr++;
+                if (ptr + 33 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                    if (m) {
+                        int idx = __builtin_ctz(m);
+                        if (ptr[idx + 1] == ',') {
+                            note_len = (size_t)idx;
+                            ptr += idx + 2;
+                            goto note_done;
+                        }
+                    }
+                }
                 while (true) {
                     while (ptr + 32 <= chunk_end) {
                         __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
@@ -214,6 +253,7 @@ int main(int argc, char* argv[]) {
                 while (*ptr != ',') ptr++;
                 note_len = (size_t)(ptr - start); ptr++;
             }
+        note_done:
 
             uint32_t region_id = (uint8_t)(*ptr++ - '0');
             while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
