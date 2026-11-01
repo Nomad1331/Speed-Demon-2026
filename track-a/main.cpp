@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <immintrin.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -22,7 +23,6 @@
 #endif
 
 static const char DIGITS_LUT[] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
-
 inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) { *p++ = (char)('0' + val); return p; }
     char buf[12], *b = buf + 12;
@@ -30,7 +30,6 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) *--b = (char)('0' + val); else { b -= 2; memcpy(b, &DIGITS_LUT[val * 2], 2); }
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
 }
-
 inline void append_line(std::string& out, const std::string& h, const std::string& ep,
                         uint32_t count, uint32_t p50, uint32_t p95, uint32_t p99, uint32_t errs, uint32_t ppm) {
     char buf[256], *p = buf;
@@ -40,7 +39,6 @@ inline void append_line(std::string& out, const std::string& h, const std::strin
     p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n';
     out.append(buf, p - buf);
 }
-
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
@@ -48,8 +46,7 @@ struct MappedFile {
     bool open(const std::string& path) {
         hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER fs;
-        if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
+        LARGE_INTEGER fs; if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
         hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
         return hMap && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
     }
@@ -59,18 +56,28 @@ struct MappedFile {
     bool open(const std::string& path) {
         if ((fd = ::open(path.c_str(), O_RDONLY)) < 0) return false;
         struct stat st; if (fstat(fd, &st) < 0 || (size = (size_t)st.st_size) == 0) { ::close(fd); return false; }
-        data = (const char*)::mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0); return data != MAP_FAILED;
+        data = (const char*)::mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (data != MAP_FAILED) madvise((void*)data, size, MADV_SEQUENTIAL);
+        return data != MAP_FAILED;
     }
     ~MappedFile() { if (data && data != MAP_FAILED) munmap((void*)data, size); if (fd >= 0) ::close(fd); }
 #endif
 };
 
-inline void drop_pages(const char* ptr, size_t len) {
+inline void evict_range(uintptr_t s, uintptr_t e) {
 #ifndef _WIN32
-    if (!ptr || len == 0) return;
-    uintptr_t s = (uintptr_t)ptr & ~4095ULL, e = ((uintptr_t)ptr + len + 4095ULL) & ~4095ULL;
-    madvise((void*)s, e - s, MADV_DONTNEED);
+    s &= ~4095ULL; e &= ~4095ULL; if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
 #endif
+}
+template<char CH>
+inline const char* find_char_avx2(const char* cur, const char* end, __m256i tgt) {
+    if (cur >= end) return end;
+    while (cur + 32 <= end) {
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)cur), tgt));
+        if (m) return cur + __builtin_ctz(m);
+        cur += 32;
+    }
+    while (cur < end && *cur != CH) ++cur; return cur;
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
@@ -82,8 +89,7 @@ struct EndpointTable {
     inline uint16_t lookup_or_insert(const char* s, uint16_t len, uint64_t h, std::vector<std::string>& eps) {
         size_t idx = h & MASK;
         while (entries[idx].hash != 0) {
-            if (entries[idx].hash == h && entries[idx].len == len && !memcmp(eps[entries[idx].local_id].data(), s, len))
-                return entries[idx].local_id;
+            if (entries[idx].hash == h && entries[idx].len == len && !memcmp(eps[entries[idx].local_id].data(), s, len)) return entries[idx].local_id;
             idx = (idx + 1) & MASK;
         }
         uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, len, lid, 0}; return lid;
@@ -104,11 +110,8 @@ struct ThreadData {
     std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
     std::string out_buffer;
-    ThreadData() : counts(MAX_H * MAX_EP, 0), errors(MAX_H * MAX_EP, 0) {
-        local_endpoints.reserve(2048); active_groups.reserve(4096);
-    }
+    ThreadData() : counts(MAX_H * MAX_EP, 0), errors(MAX_H * MAX_EP, 0) { local_endpoints.reserve(2048); active_groups.reserve(4096); }
 };
-
 inline int get_hour_id(const char* p) {
     int d = (p[8] - '0') * 10 + (p[9] - '0'), h = (p[11] - '0') * 10 + (p[12] - '0');
     return ((p[6] == '0') ? (d - 30) : (d + 1)) * 24 + h - 18;
@@ -122,27 +125,21 @@ int main(int argc, char* argv[]) {
     }
     std::filesystem::path in_path = std::filesystem::path(data_dir) / "requests.log", out_path = std::filesystem::path(out_dir) / "summary.txt";
     std::filesystem::create_directories(out_dir);
-
     MappedFile mf;
-    if (!mf.open(in_path.string()) || mf.size == 0) {
-        FILE* f = fopen(out_path.string().c_str(), "wb"); if (f) fclose(f); return 0;
-    }
+    if (!mf.open(in_path.string()) || mf.size == 0) { FILE* f = fopen(out_path.string().c_str(), "wb"); if (f) fclose(f); return 0; }
 
     static const size_t H = 72;
     std::string hour_strings[H];
     {
         size_t idx = 0;
         auto add_h = [&](const char* pr, int s, int e) {
-            for (int h = s; h <= e; ++h) {
-                char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf;
-            }
+            for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; }
         };
         add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17);
     }
 
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf.size < 100000) nthreads = 1;
-
     struct Chunk { size_t start = 0, end = 0; };
     std::vector<Chunk> chunks(nthreads);
     for (unsigned int i = 0; i < nthreads; ++i) {
@@ -151,36 +148,39 @@ int main(int argc, char* argv[]) {
         if (i + 1 < nthreads) { while (e < mf.size && mf.data[e] != '\n') ++e; if (e < mf.size) ++e; } else e = mf.size;
         chunks[i] = {s, e};
     }
-
     std::vector<ThreadData> tdata(nthreads);
     std::vector<std::string> global_endpoints;
     size_t N = 0, G = 0;
     std::vector<uint32_t> global_counts, global_errors, all_latencies, write_offsets;
     std::vector<size_t> group_offsets;
     std::barrier sync_point(nthreads);
-
     auto worker_fn = [&](unsigned int t) {
         auto& td = tdata[t];
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         char last_hour[13] = {0}; int last_hid = -1;
-
-        // Pass 1: Parse endpoints, hours, counts, and errors (hash computed while scanning)
+        __m256i sp = _mm256_set1_epi8(' '), nl = _mm256_set1_epi8('\n');
+        uintptr_t last_evict = (uintptr_t)p & ~4095ULL;
+        // Pass 1: AVX2 scanning of method, endpoint, status, and sliding madvise
         while (p < end) {
             if (p + 27 > end) break;
             int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
             if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
-            const char* cur = p + 28; while (*cur != ' ') ++cur;
-            const char* ep_start = ++cur;
-            uint64_t ep_hash = 14695981039346656037ULL;
-            while (*cur != ' ') { ep_hash = (ep_hash ^ (uint8_t)*cur) * 1099511628211ULL; ++cur; }
+            const char* cur = p + 28;
+            int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
+            if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
+            const char* ep_start = cur;
+            cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
+            uint64_t ep_hash = 14695981039346656037ULL;
+            for (const char* k = ep_start; k < cur; ++k) ep_hash = (ep_hash ^ (uint8_t)*k) * 1099511628211ULL;
             uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
-            const char* st = ++cur; size_t idx = (size_t)hid * MAX_EP + ep_id;
+            size_t idx = (size_t)hid * MAX_EP + ep_id;
             if (td.counts[idx]++ == 0) td.active_groups.push_back({(uint8_t)hid, ep_id});
-            if (st[0] == '5') td.errors[idx]++;
-            cur = st + 4; while (*cur != '\n') ++cur; p = cur + 1;
+            if (cur[1] == '5') td.errors[idx]++;
+            p = find_char_avx2<'\n'>(cur + 5, end, nl) + 1;
+            if ((size_t)((uintptr_t)p - last_evict) >= 524288) { uintptr_t cp = (uintptr_t)p & ~4095ULL; evict_range(last_evict, cp); last_evict = cp; }
         }
-        drop_pages(mf.data + chunks[t].start, chunks[t].end - chunks[t].start);
+        evict_range(last_evict, ((uintptr_t)end + 4095ULL) & ~4095ULL);
         sync_point.arrive_and_wait();
 
         if (t == 0) {
@@ -214,14 +214,12 @@ int main(int argc, char* argv[]) {
             group_offsets.resize(G + 1, 0);
             for (size_t g = 0; g < G; ++g) group_offsets[g + 1] = group_offsets[g] + global_counts[g];
             all_latencies.resize(group_offsets[G]);
-
             write_offsets.resize(nthreads * G);
             for (size_t g = 0; g < G; ++g) write_offsets[0 * G + g] = (uint32_t)group_offsets[g];
             for (unsigned int ot = 1; ot < nthreads; ++ot) {
                 memcpy(&write_offsets[ot * G], &write_offsets[(ot - 1) * G], G * sizeof(uint32_t));
-                for (const auto& ag : tdata[ot - 1].active_groups) {
+                for (const auto& ag : tdata[ot - 1].active_groups)
                     write_offsets[ot * G + (size_t)ag.hid * N + tdata[ot - 1].ep_remap[ag.lep]] += tdata[ot - 1].counts[(size_t)ag.hid * MAX_EP + ag.lep];
-                }
             }
             for (unsigned int ot = 0; ot < nthreads; ++ot) {
                 tdata[ot].counts.clear(); tdata[ot].counts.shrink_to_fit();
@@ -231,25 +229,30 @@ int main(int argc, char* argv[]) {
         }
         sync_point.arrive_and_wait();
 
-        // Pass 2: Stream latencies directly into flat all_latencies array
+        // Pass 2: AVX2 scanning and streaming latencies into flat all_latencies array
         p = mf.data + chunks[t].start; last_hid = -1;
+        last_evict = (uintptr_t)p & ~4095ULL;
         uint32_t* wp = &write_offsets[t * G];
         while (p < end) {
             if (p + 27 > end) break;
             int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
             if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
-            const char* cur = p + 28; while (*cur != ' ') ++cur;
-            const char* ep_start = ++cur;
-            uint64_t ep_hash = 14695981039346656037ULL;
-            while (*cur != ' ') { ep_hash = (ep_hash ^ (uint8_t)*cur) * 1099511628211ULL; ++cur; }
+            const char* cur = p + 28;
+            int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
+            if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
+            const char* ep_start = cur;
+            cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
+            uint64_t ep_hash = 14695981039346656037ULL;
+            for (const char* k = ep_start; k < cur; ++k) ep_hash = (ep_hash ^ (uint8_t)*k) * 1099511628211ULL;
             uint16_t gep = td.ep_table.lookup(ep_len, ep_hash);
             cur += 5; uint32_t lat = 0;
             while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
             all_latencies[wp[(size_t)hid * N + gep]++] = lat;
             if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
+            if ((size_t)((uintptr_t)p - last_evict) >= 524288) { uintptr_t cp = (uintptr_t)p & ~4095ULL; evict_range(last_evict, cp); last_evict = cp; }
         }
-        drop_pages(mf.data + chunks[t].start, chunks[t].end - chunks[t].start);
+        evict_range(last_evict, ((uintptr_t)end + 4095ULL) & ~4095ULL);
         sync_point.arrive_and_wait();
 
         if (t == 0) { write_offsets.clear(); write_offsets.shrink_to_fit(); }
@@ -263,19 +266,18 @@ int main(int argc, char* argv[]) {
         size_t g_e = (t == nthreads - 1) ? G : (size_t)(std::lower_bound(group_offsets.begin(), group_offsets.end(), t_e) - group_offsets.begin());
 
         for (size_t g = g_s; g < g_e; ++g) {
-            size_t n = global_counts[g];
-            if (n == 0) continue;
+            size_t n = global_counts[g]; if (n == 0) continue;
             size_t h = g / N, gep = g % N;
-            uint32_t* begin = &all_latencies[group_offsets[g]], *end = begin + n, p50, p95, p99;
+            uint32_t* begin = &all_latencies[group_offsets[g]], *end_lat = begin + n, p50, p95, p99;
             if (n == 1) { p50 = p95 = p99 = begin[0]; }
             else if (n == 2) {
                 if (begin[0] > begin[1]) std::swap(begin[0], begin[1]);
                 p50 = begin[0]; p95 = p99 = begin[1];
             } else {
                 size_t r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-                if (n <= 64) { std::sort(begin, end); p50 = begin[r50]; p95 = begin[r95]; p99 = begin[r99]; }
+                if (n <= 64) { std::sort(begin, end_lat); p50 = begin[r50]; p95 = begin[r95]; p99 = begin[r99]; }
                 else {
-                    std::nth_element(begin, begin + r99, end); p99 = begin[r99];
+                    std::nth_element(begin, begin + r99, end_lat); p99 = begin[r99];
                     std::nth_element(begin, begin + r95, begin + r99); p95 = begin[r95];
                     std::nth_element(begin, begin + r50, begin + r95); p50 = begin[r50];
                 }
@@ -288,7 +290,6 @@ int main(int argc, char* argv[]) {
     for (unsigned int t = 1; t < nthreads; ++t) workers.emplace_back(worker_fn, t);
     worker_fn(0);
     for (auto& w : workers) w.join();
-
     FILE* f = fopen(out_path.string().c_str(), "wb");
     if (!f) return 1;
     for (unsigned int t = 0; t < nthreads; ++t) if (!tdata[t].out_buffer.empty()) fwrite(tdata[t].out_buffer.data(), 1, tdata[t].out_buffer.size(), f);
