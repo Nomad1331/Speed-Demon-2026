@@ -59,11 +59,11 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-// Ultra-compact 1 MB SIMD 4-slot hash table
-static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
+// 2 MB SIMD 4-slot hash table (262,144 slots -> 42.5% load factor at full scale)
+static constexpr u32 BITS = 18, SLOTS = 1 << BITS;
 alignas(64) static std::atomic<u64> g_slots[SLOTS];
 
-// Country bitsets: 256 countries * 2048 words (4 MB total)
+// Country bitsets: 256 countries * 4096 words (8 MB total, charged only once touched)
 static constexpr u32 WORDS_PER_COUNTRY = SLOTS / 64;
 alignas(64) static std::atomic<u64> g_seen_bits[256 * WORDS_PER_COUNTRY];
 
@@ -165,12 +165,16 @@ int main(int argc, char* argv[]) {
 
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf_records.size < 200000) nthreads = 1;
-    Chunk chunks[16]; chunks[0].start = ptr0;
-    if (nthreads == 1) chunks[0].end = file_end;
+
+    // Dynamic work-stealing with 64 pieces to eliminate tail latency
+    const unsigned int num_pieces = (nthreads == 1) ? 1 : 64;
+    std::vector<Chunk> chunks(num_pieces);
+    chunks[0].start = ptr0;
+    if (num_pieces == 1) chunks[0].end = file_end;
     else {
         __m256i v_cr = _mm256_set1_epi8('\r');
-        for (unsigned int i = 1; i < nthreads; ++i) {
-            const char* cur = mf_records.data + (mf_records.size * i) / nthreads;
+        for (unsigned int i = 1; i < num_pieces; ++i) {
+            const char* cur = mf_records.data + (mf_records.size * i) / num_pieces;
             while (cur + 32 < file_end) {
                 __m256i v = _mm256_loadu_si256((const __m256i*)cur);
                 uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_cr));
@@ -185,130 +189,142 @@ int main(int argc, char* argv[]) {
             cur = (cur + 1 < file_end) ? cur + 2 : file_end;
         found_chunk: chunks[i].start = cur; chunks[i - 1].end = cur;
         }
-        chunks[nthreads - 1].end = file_end;
+        chunks[num_pieces - 1].end = file_end;
     }
 
     uint8_t out_order[241];
     for (uint16_t i = 0; i < num_countries; ++i) out_order[i] = (uint8_t)(i + 1);
     out_order[num_countries] = 0;
 
+    std::atomic<unsigned int> piece_idx{0};
+
     auto worker_fn = [&](unsigned int t) {
-        const char* ptr = chunks[t].start, *chunk_end = chunks[t].end;
         auto& my_countries = tdata[t].countries;
         __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
 
-        while (ptr < chunk_end) {
-            if (__builtin_expect((uint8_t)*ptr == 0xef, 0)) {
-                if (ptr + 3 <= chunk_end && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
-            }
-            uint64_t id = (uint8_t)(*ptr++ - '0');
-            while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
-            ptr++;
-            uint32_t crc = 0; size_t name_len = 0;
-            if (__builtin_expect(*ptr == '"', 1)) {
-                ptr++;
-                if (ptr + 33 <= chunk_end) {
-                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                    uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
-                    if (mask) {
-                        int idx = __builtin_ctz(mask);
-                        if (ptr[idx + 1] == ',') {
-                            name_len = (size_t)idx;
-                            const char* cp = ptr;
-                            while (idx >= 8) {
-                                crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t*)cp);
-                                cp += 8; idx -= 8;
-                            }
-                            if (idx >= 4) {
-                                crc = _mm_crc32_u32(crc, *(const uint32_t*)cp);
-                                cp += 4; idx -= 4;
-                            }
-                            while (idx > 0) {
-                                crc = _mm_crc32_u8(crc, (uint8_t)*cp++);
-                                idx--;
-                            }
-                            ptr += name_len + 2;
-                            goto name_done;
-                        }
-                    }
-                }
-                while (true) {
-                    char c = *ptr++;
-                    if (__builtin_expect(c != '"', 1)) { crc = _mm_crc32_u8(crc, (uint8_t)c); name_len++; }
-                    else if (*ptr == '"') { ptr++; crc = _mm_crc32_u8(crc, '"'); name_len++; }
-                    else break;
-                }
-                ptr++;
-            } else {
-                while (*ptr != ',') { crc = _mm_crc32_u8(crc, (uint8_t)*ptr++); name_len++; }
-                ptr++;
-            }
-        name_done:
-            uint64_t name_hash = ((uint64_t)name_len << 32) | crc;
+        for (;;) {
+            unsigned int p_idx = piece_idx.fetch_add(1, std::memory_order_relaxed);
+            if (p_idx >= num_pieces) break;
 
-            size_t note_len = 0;
-            if (__builtin_expect(*ptr == '"', 1)) {
+            const char* ptr = chunks[p_idx].start, *chunk_end = chunks[p_idx].end;
+
+            while (ptr < chunk_end) {
+                _mm_prefetch(ptr + 2048, _MM_HINT_T0);
+                if (__builtin_expect((uint8_t)*ptr == 0xef, 0)) {
+                    if (ptr + 3 <= chunk_end && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
+                }
+                uint64_t id = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
                 ptr++;
-                if (ptr + 33 <= chunk_end) {
-                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
-                    if (m) {
-                        int idx = __builtin_ctz(m);
-                        if (ptr[idx + 1] == ',') {
-                            note_len = (size_t)idx;
-                            ptr += idx + 2;
-                            goto note_done;
+                uint32_t crc = 0; size_t name_len = 0;
+                if (__builtin_expect(*ptr == '"', 1)) {
+                    ptr++;
+                    if (ptr + 33 <= chunk_end) {
+                        __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                        uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                        if (mask) {
+                            int idx = __builtin_ctz(mask);
+                            if (ptr[idx + 1] == ',') {
+                                name_len = (size_t)idx;
+                                const char* cp = ptr;
+                                while (idx >= 8) {
+                                    crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t*)cp);
+                                    cp += 8; idx -= 8;
+                                }
+                                if (idx >= 4) {
+                                    crc = _mm_crc32_u32(crc, *(const uint32_t*)cp);
+                                    cp += 4; idx -= 4;
+                                }
+                                while (idx > 0) {
+                                    crc = _mm_crc32_u8(crc, (uint8_t)*cp++);
+                                    idx--;
+                                }
+                                ptr += name_len + 2;
+                                goto name_done;
+                            }
                         }
                     }
+                    while (true) {
+                        char c = *ptr++;
+                        if (__builtin_expect(c != '"', 1)) { crc = _mm_crc32_u8(crc, (uint8_t)c); name_len++; }
+                        else if (*ptr == '"') { ptr++; crc = _mm_crc32_u8(crc, '"'); name_len++; }
+                        else break;
+                    }
+                    ptr++;
+                } else {
+                    while (*ptr != ',') { crc = _mm_crc32_u8(crc, (uint8_t)*ptr++); name_len++; }
+                    ptr++;
                 }
-                while (true) {
-                    while (ptr + 32 <= chunk_end) {
+            name_done:
+                uint64_t name_hash = ((uint64_t)name_len << 32) | crc;
+
+                size_t note_len = 0;
+                if (__builtin_expect(*ptr == '"', 1)) {
+                    ptr++;
+                    if (ptr + 33 <= chunk_end) {
                         __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
                         uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
-                        if (m) { note_len += __builtin_ctz(m); ptr += __builtin_ctz(m); break; }
-                        note_len += 32; ptr += 32;
+                        if (m) {
+                            int idx = __builtin_ctz(m);
+                            if (ptr[idx + 1] == ',') {
+                                note_len = (size_t)idx;
+                                ptr += idx + 2;
+                                goto note_done;
+                            }
+                        }
                     }
-                    char c = *ptr++;
-                    if (__builtin_expect(c != '"', 1)) note_len++;
-                    else if (*ptr == '"') { ptr++; note_len++; }
-                    else break;
+                    while (true) {
+                        while (ptr + 32 <= chunk_end) {
+                            __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                            uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                            if (m) { note_len += __builtin_ctz(m); ptr += __builtin_ctz(m); break; }
+                            note_len += 32; ptr += 32;
+                        }
+                        char c = *ptr++;
+                        if (__builtin_expect(c != '"', 1)) note_len++;
+                        else if (*ptr == '"') { ptr++; note_len++; }
+                        else break;
+                    }
+                    ptr++;
+                } else {
+                    const char* start = ptr;
+                    while (ptr + 32 <= chunk_end) {
+                        __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
+                        if (m) { ptr += __builtin_ctz(m); break; }
+                        ptr += 32;
+                    }
+                    while (*ptr != ',') ptr++;
+                    note_len = (size_t)(ptr - start); ptr++;
                 }
+            note_done:
+
+                uint32_t region_id = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
                 ptr++;
-            } else {
-                const char* start = ptr;
-                while (ptr + 32 <= chunk_end) {
-                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
-                    if (m) { ptr += __builtin_ctz(m); break; }
-                    ptr += 32;
+                bool neg = (*ptr == '-'); ptr += neg;
+                int64_t cents = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
+                ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
+                if (neg) cents = -cents;
+                if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
+
+                uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
+                LocalCountryAgg& agg = my_countries[cid];
+                if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
+                else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
+                agg.count++; agg.id_sum += id; agg.amount_sum += cents;
+                agg.name_bytes += name_len; agg.note_bytes += note_len;
+
+                uint64_t nh = name_hash ? name_hash : 1;
+                u32 name_id = get_name_id(nh);
+                if (mark_seen(cid, name_id)) {
+                    agg.distinct_names++;
                 }
-                while (*ptr != ',') ptr++;
-                note_len = (size_t)(ptr - start); ptr++;
             }
-        note_done:
-
-            uint32_t region_id = (uint8_t)(*ptr++ - '0');
-            while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
-            ptr++;
-            bool neg = (*ptr == '-'); ptr += neg;
-            int64_t cents = (uint8_t)(*ptr++ - '0');
-            while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
-            ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
-            if (neg) cents = -cents;
-            if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
-
-            uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
-            LocalCountryAgg& agg = my_countries[cid];
-            if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
-            else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
-            agg.count++; agg.id_sum += id; agg.amount_sum += cents;
-            agg.name_bytes += name_len; agg.note_bytes += note_len;
-
-            uint64_t nh = name_hash ? name_hash : 1;
-            u32 name_id = get_name_id(nh);
-            if (mark_seen(cid, name_id)) {
-                agg.distinct_names++;
-            }
+            uintptr_t p_from = reinterpret_cast<uintptr_t>(chunks[p_idx].start) & ~uintptr_t(4095);
+            uintptr_t p_to = reinterpret_cast<uintptr_t>(chunks[p_idx].end) & ~uintptr_t(4095);
+            if (p_to > p_from) madvise(reinterpret_cast<void*>(p_from), p_to - p_from, MADV_DONTNEED);
         }
     };
 

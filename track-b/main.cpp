@@ -186,6 +186,7 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
     u64 m = 0;  // token bytes of the window at q not yet consumed
     for (bool fresh = true; q < e;) {
         if (fresh) {
+            _mm_prefetch(reinterpret_cast<const char*>(q + 2048), _MM_HINT_T0);
             m = token_bytes(q);
             if (e - q < 64) m &= (1ull << (e - q)) - 1;
             fresh = false;
@@ -200,13 +201,16 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
         if (t > q + 64) { q = t; fresh = true; }
         const size_t len = t - s;
         if (len > MAX_TERM) continue;
+        alignas(32) static const uint8_t KEEP[64] = {
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        };
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s));
+        __m256i mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(KEEP + 32 - len));
+        __m256i k_vec = _mm256_and_si256(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), mask);
         Key k;
-        for (size_t i = 0; i < 4; ++i) {
-            size_t b = len > 8 * i ? std::min<size_t>(len - 8 * i, 8) : 0;
-            u64 w;
-            memcpy(&w, s + 8 * i, 8);
-            k.w[i] = (w | 0x2020202020202020ull) & (b == 8 ? ~0ull : (1ull << (8 * b)) - 1);
-        }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(k.w), k_vec);
         const u64 h = hash_key(k);
         terms.prefetch(h);
         const size_t slot = n++ % LAG;
