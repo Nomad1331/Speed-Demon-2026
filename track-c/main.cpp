@@ -253,6 +253,13 @@ int main(int argc, char* argv[]) {
             my_names[cid].push_back(name_hash);
         }
 
+        for (int c = 0; c < 241; ++c) {
+            if (!my_names[c].empty()) {
+                std::sort(my_names[c].begin(), my_names[c].end());
+                my_names[c].erase(std::unique(my_names[c].begin(), my_names[c].end()), my_names[c].end());
+            }
+        }
+
         sync_point.arrive_and_wait();
 
         uint16_t total_c = num_countries + 1;

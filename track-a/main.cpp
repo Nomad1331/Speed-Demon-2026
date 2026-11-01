@@ -73,7 +73,7 @@ inline uint32_t hash_endpoint(const char* s, size_t len) {
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct EpEntry { uint32_t hash = 0; uint16_t local_id = 0, global_id = 0; };
+struct EpEntry { uint32_t hash = 0; uint16_t local_id = 0; };
 struct EndpointTable {
     static constexpr size_t CAP = 4096, MASK = CAP - 1;
     EpEntry entries[CAP];
@@ -85,23 +85,17 @@ struct EndpointTable {
                 return entries[idx].local_id;
             idx = (idx + 1) & MASK;
         }
-        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, lid, 0}; return lid;
-    }
-    inline uint16_t lookup(const char* s, size_t len, uint32_t h, const std::vector<std::string>& eps) const {
-        size_t idx = h & MASK;
-        while (true) {
-            if (entries[idx].hash == h && eps[entries[idx].local_id].size() == len && !memcmp(eps[entries[idx].local_id].data(), s, len))
-                return entries[idx].global_id;
-            idx = (idx + 1) & MASK;
-        }
+        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, lid}; return lid;
     }
 };
 
 struct ActiveGroup { uint8_t hid; uint16_t lep; };
+struct Record { uint32_t latency; uint16_t lep; uint8_t hid; };
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
     std::vector<ActiveGroup> active_groups;
+    std::vector<Record> records;
     std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
     std::string out_buffer;
@@ -166,19 +160,34 @@ int main(int argc, char* argv[]) {
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         char last_hour[13] = {0}; int last_hid = -1;
 
-        // Pass 1: Parse endpoints, hours, counts, and errors (zero latency parsing)
+        // Pass 1: Parse endpoints, hours, counts, errors, and latencies in one single file scan
+        td.records.reserve((chunks[t].end - chunks[t].start) / 45);
         while (p < end) {
             if (p + 27 > end) break;
             int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
             if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
-            const char* cur = p + 28; while (*cur != ' ') ++cur;
-            const char* ep_start = ++cur; while (*cur != ' ') ++cur;
+            const char* cur = p + 28;
+            switch (cur[0]) {
+                case 'G': cur += 4; break;
+                case 'P':
+                    if (cur[1] == 'O') cur += 5;
+                    else if (cur[1] == 'U') cur += 4;
+                    else cur += 6;
+                    break;
+                case 'D': cur += 7; break;
+                case 'H': cur += 5; break;
+                default: cur += 8; break;
+            }
+            const char* ep_start = cur; while (*cur != ' ') ++cur;
             size_t ep_len = cur - ep_start;
             uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, hash_endpoint(ep_start, ep_len), td.local_endpoints);
             const char* st = ++cur; size_t idx = (size_t)hid * MAX_EP + ep_id;
             if (td.counts[idx]++ == 0) td.active_groups.push_back({(uint8_t)hid, ep_id});
             if (st[0] == '5') td.errors[idx]++;
-            cur = st + 4; while (*cur != '\n') ++cur; p = cur + 1;
+            cur = st + 4; uint32_t lat = 0;
+            while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
+            td.records.push_back({lat, ep_id, (uint8_t)hid});
+            if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
         }
         sync_point.arrive_and_wait();
 
@@ -201,7 +210,6 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < lep_count; ++i) {
             td.ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), td.local_endpoints[i]) - global_endpoints.begin());
         }
-        for (auto& entry : td.ep_table.entries) { if (entry.hash) entry.global_id = td.ep_remap[entry.local_id]; }
         sync_point.arrive_and_wait();
 
         if (t == 0) {
@@ -232,22 +240,12 @@ int main(int argc, char* argv[]) {
         }
         sync_point.arrive_and_wait();
 
-        // Pass 2: Stream latencies directly into flat all_latencies array
-        p = mf.data + chunks[t].start; last_hid = -1;
+        // Pass 2: In-memory scatter into all_latencies (zero file re-parsing)
         uint32_t* wp = &write_offsets[t * G];
-        while (p < end) {
-            if (p + 27 > end) break;
-            int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
-            if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
-            const char* cur = p + 28; while (*cur != ' ') ++cur;
-            const char* ep_start = ++cur; while (*cur != ' ') ++cur;
-            size_t ep_len = cur - ep_start;
-            uint16_t gep = td.ep_table.lookup(ep_start, ep_len, hash_endpoint(ep_start, ep_len), td.local_endpoints);
-            cur += 5; uint32_t lat = 0;
-            while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
-            all_latencies[wp[(size_t)hid * N + gep]++] = lat;
-            if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
+        for (const auto& r : td.records) {
+            all_latencies[wp[(size_t)r.hid * N + td.ep_remap[r.lep]]++] = r.latency;
         }
+        td.records.clear(); td.records.shrink_to_fit();
         sync_point.arrive_and_wait();
 
         // Pass 3: Parallel Percentiles & Output Formatting
