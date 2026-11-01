@@ -30,8 +30,7 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
 }
 
-inline void append_line(std::string& out, const std::string& h, const std::string& ep,
-                        uint32_t count, uint32_t p50, uint32_t p95, uint32_t p99, uint32_t errs, uint32_t ppm) {
+inline void append_line(std::string& out, const std::string& h, const std::string& ep, uint32_t count, uint32_t p50, uint32_t p95, uint32_t p99, uint32_t errs, uint32_t ppm) {
     char buf[512], *p = buf;
     memcpy(p, h.data(), h.size()); p += h.size(); *p++ = ' '; memcpy(p, ep.data(), ep.size()); p += ep.size(); *p++ = ' ';
     p = write_u32_fast(p, count); *p++ = ' '; p = write_u32_fast(p, p50); *p++ = ' ';
@@ -43,19 +42,14 @@ inline void append_line(std::string& out, const std::string& h, const std::strin
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
-    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
+    int fd = -1; HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
     bool open(const std::string& path) {
         hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
         LARGE_INTEGER fs; if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
-        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        return hMap && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
+        return (hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL)) && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
     }
-    void close() {
-        if (data) { UnmapViewOfFile(data); data = nullptr; }
-        if (hMap) { CloseHandle(hMap); hMap = NULL; }
-        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
-    }
+    void close() { if (data) { UnmapViewOfFile(data); data = nullptr; } if (hMap) { CloseHandle(hMap); hMap = NULL; } if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; } }
 #else
     int fd = -1;
     bool open(const std::string& path) {
@@ -65,13 +59,19 @@ struct MappedFile {
         if (data != MAP_FAILED) madvise((void*)data, size, MADV_SEQUENTIAL);
         return data != MAP_FAILED;
     }
-    void close() {
-        if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); data = nullptr; }
-        if (fd >= 0) { ::close(fd); fd = -1; }
-    }
+    void close() { if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); data = nullptr; } if (fd >= 0) { ::close(fd); fd = -1; } }
 #endif
     ~MappedFile() { close(); }
 };
+
+#ifndef _WIN32
+inline void evict_range(int fd, const char* base, const char* start, const char* end) {
+    uintptr_t s = ((uintptr_t)start + 4095ULL) & ~4095ULL, e = ((uintptr_t)end) & ~4095ULL;
+    if (e > s) { madvise((void*)s, e - s, MADV_DONTNEED); if (fd >= 0) posix_fadvise(fd, (off_t)(s - (uintptr_t)base), (off_t)(e - s), POSIX_FADV_DONTNEED); }
+}
+#else
+inline void evict_range(int, const char*, const char*, const char*) {}
+#endif
 
 template<char CH>
 inline const char* find_char_avx2(const char* cur, const char* end, __m256i tgt) {
@@ -94,28 +94,27 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
 struct EpEntry { uint64_t hash = 0; uint16_t len = 0, local_id = 0; };
 struct EndpointTable {
-    static constexpr size_t CAP = 8192, MASK = CAP - 1;
-    EpEntry entries[CAP];
+    static constexpr size_t CAP = 8192, MASK = CAP - 1; EpEntry entries[CAP];
     EndpointTable() { memset(entries, 0, sizeof(entries)); }
     inline uint16_t lookup_or_insert(const char* s, uint16_t len, uint64_t h, std::vector<std::string>& eps) {
         size_t idx = h & MASK;
-        while (entries[idx].hash != 0) {
-            if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].local_id;
-            idx = (idx + 1) & MASK;
-        }
+        while (entries[idx].hash != 0) { if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].local_id; idx = (idx + 1) & MASK; }
         uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, len, lid}; return lid;
     }
+    inline uint16_t lookup(uint16_t len, uint64_t h) const {
+        size_t idx = h & MASK;
+        while (entries[idx].hash != 0) { if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].local_id; idx = (idx + 1) & MASK; }
+        return 0;
+    }
 };
-
-struct ReqItem { uint32_t lat; uint16_t ep_id; uint8_t hid; uint8_t is_err; };
 
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
-    std::vector<ReqItem> local_reqs;
     std::vector<uint16_t> ep_remap;
+    std::unique_ptr<uint32_t[]> counts, errors;
     std::string out_buffer;
-    ThreadData() { local_endpoints.reserve(2048); }
+    ThreadData() : counts(std::make_unique<uint32_t[]>(MAX_H * MAX_EP)), errors(std::make_unique<uint32_t[]>(MAX_H * MAX_EP)) { local_endpoints.reserve(2048); }
 };
 
 inline int get_hour_id(const char* p) {
@@ -148,7 +147,6 @@ int main(int argc, char* argv[]) {
     }
     std::vector<ThreadData> tdata(nthreads);
     std::vector<std::string> global_endpoints; size_t N = 0, G = 0;
-    std::unique_ptr<std::atomic<uint32_t>[]> atomic_counts, atomic_errors;
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
     std::vector<size_t> group_offsets;
     std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
@@ -156,88 +154,90 @@ int main(int argc, char* argv[]) {
 
     auto worker_fn = [&](unsigned int t) {
         auto& td = tdata[t];
-        const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
+        const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end, *last_evict = p;
         uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' ');
-        td.local_reqs.reserve((chunks[t].end - chunks[t].start) / 60);
 
         while (p < end) {
-            if (p + 40 > end) break;
+            if (__builtin_expect(p - last_evict >= 1048576, 0)) { evict_range(mf.fd, mf.data, last_evict, p); last_evict = p; }
+            if (p + 35 > end) break;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
             int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
             if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
             const char* cur = p + 28;
             int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
-            const char* ep_start = cur;
-            cur = find_char_avx2<' '>(cur, end, sp);
-            uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
-            uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
-            uint8_t is_err = (cur[1] == '5');
-            cur += 5;
-            uint32_t lat = (uint8_t)(*cur++ - '0');
-            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
-            td.local_reqs.push_back({lat, ep_id, (uint8_t)hid, is_err});
-            while (cur < end && (*cur == '\r' || *cur == '\n')) ++cur;
-            p = cur;
+            const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
+            uint16_t ep_len = (uint16_t)(cur - ep_start), ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, hash_endpoint(ep_start, ep_len), td.local_endpoints);
+            size_t cell = (size_t)hid * MAX_EP + ep_id;
+            td.counts[cell]++; if (cur[1] == '5') td.errors[cell]++;
+            while (*cur != '\n') ++cur; ++cur; p = cur;
         }
+        if (p > last_evict) evict_range(mf.fd, mf.data, last_evict, p);
         sync_point.arrive_and_wait();
 
         if (t == 0) {
             global_endpoints = tdata[0].local_endpoints;
             std::sort(global_endpoints.begin(), global_endpoints.end());
-            for (unsigned int ot = 1; ot < nthreads; ++ot) {
+            for (unsigned int ot = 1; ot < nthreads; ++ot)
                 for (const auto& ep : tdata[ot].local_endpoints) {
                     auto it = std::lower_bound(global_endpoints.begin(), global_endpoints.end(), ep);
                     if (it == global_endpoints.end() || *it != ep) global_endpoints.insert(it, ep);
                 }
-            }
             N = global_endpoints.size(); G = H * N;
             for (unsigned int ot = 0; ot < nthreads; ++ot) {
                 tdata[ot].ep_remap.resize(tdata[ot].local_endpoints.size());
                 for (size_t i = 0; i < tdata[ot].local_endpoints.size(); ++i)
                     tdata[ot].ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), tdata[ot].local_endpoints[i]) - global_endpoints.begin());
+            }
+            global_counts.assign(G, 0); global_errors.assign(G, 0);
+            for (unsigned int ot = 0; ot < nthreads; ++ot) {
+                size_t num_eps = tdata[ot].local_endpoints.size(); const auto& remap = tdata[ot].ep_remap;
+                for (size_t h = 0; h < H; ++h) {
+                    size_t base = h * MAX_EP;
+                    for (size_t ep = 0; ep < num_eps; ++ep) {
+                        uint32_t c = tdata[ot].counts[base + ep];
+                        if (c) { size_t g = h * N + remap[ep]; global_counts[g] += c; global_errors[g] += tdata[ot].errors[base + ep]; }
+                    }
+                }
+                tdata[ot].counts.reset(); tdata[ot].errors.reset();
                 tdata[ot].local_endpoints.clear(); tdata[ot].local_endpoints.shrink_to_fit();
             }
-            if (G > 0) { atomic_counts = std::make_unique<std::atomic<uint32_t>[]>(G); atomic_errors = std::make_unique<std::atomic<uint32_t>[]>(G); }
-            mf.close();
+            group_offsets.resize(G + 1, 0); atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
+            size_t total = 0;
+            for (size_t g = 0; g < G; ++g) {
+                group_offsets[g] = (uint32_t)total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed); total += global_counts[g];
+            }
+            group_offsets[G] = (uint32_t)total; all_latencies.resize(total);
         }
         sync_point.arrive_and_wait();
 
         if (N == 0) return;
-        const auto& remap = td.ep_remap;
-        for (const auto& req : td.local_reqs) {
-            uint32_t ggid = (uint32_t)req.hid * N + remap[req.ep_id];
-            atomic_counts[ggid].fetch_add(1, std::memory_order_relaxed);
-            if (req.is_err) atomic_errors[ggid].fetch_add(1, std::memory_order_relaxed);
+
+        p = mf.data + chunks[t].start; last_evict = p; last_tag = 0; last_hid = -1;
+        while (p < end) {
+            if (__builtin_expect(p - last_evict >= 1048576, 0)) { evict_range(mf.fd, mf.data, last_evict, p); last_evict = p; }
+            if (p + 35 > end) break;
+            uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
+            int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
+            if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
+            const char* cur = p + 28;
+            int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
+            if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
+            const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
+            uint16_t ep_len = (uint16_t)(cur - ep_start);
+            uint16_t ep_id = td.ep_table.lookup(ep_len, hash_endpoint(ep_start, ep_len));
+            cur += 5; uint32_t lat = (uint8_t)(*cur++ - '0');
+            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
+            uint32_t ggid = (uint32_t)hid * N + td.ep_remap[ep_id];
+            all_latencies[atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed)] = lat;
+            while (*cur != '\n') ++cur; ++cur; p = cur;
         }
+        if (p > last_evict) evict_range(mf.fd, mf.data, last_evict, p);
+        td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
         sync_point.arrive_and_wait();
 
-        if (t == 0) {
-            global_counts.resize(G); global_errors.resize(G); group_offsets.resize(G + 1, 0);
-            atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
-            size_t total = 0;
-            for (size_t g = 0; g < G; ++g) {
-                uint32_t c = atomic_counts[g].load(std::memory_order_relaxed);
-                global_counts[g] = c; global_errors[g] = atomic_errors[g].load(std::memory_order_relaxed);
-                group_offsets[g] = total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed);
-                total += c;
-            }
-            group_offsets[G] = total; all_latencies.resize(total);
-            atomic_counts.reset(); atomic_errors.reset();
-        }
-        sync_point.arrive_and_wait();
-
-        for (const auto& req : td.local_reqs) {
-            uint32_t ggid = (uint32_t)req.hid * N + remap[req.ep_id];
-            uint32_t pos = atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed);
-            all_latencies[pos] = req.lat;
-        }
-        td.local_reqs.clear(); td.local_reqs.shrink_to_fit(); td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
-        sync_point.arrive_and_wait();
-
-        if (t == 0) atomic_write_offsets.reset();
+        if (t == 0) { mf.close(); atomic_write_offsets.reset(); }
         auto& out = td.out_buffer; out.reserve(512 * 1024);
         size_t total_lines = group_offsets[G];
         size_t t_s = (total_lines * t) / nthreads, t_e = (total_lines * (t + 1)) / nthreads;
