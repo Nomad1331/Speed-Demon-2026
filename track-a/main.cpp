@@ -35,30 +35,30 @@ inline char* write_u32_fast(char* p, uint32_t val) {
 inline uint32_t u32_len(uint32_t v) {
     if (v < 10) return 1; if (v < 100) return 2; if (v < 1000) return 3; if (v < 10000) return 4;
     if (v < 100000) return 5; if (v < 1000000) return 6; if (v < 10000000) return 7;
-    if (v < 100000000) return 8; if (v < 1000000000) return 9; return 10;
+    return (v < 100000000) ? 8 : (v < 1000000000 ? 9 : 10);
 }
 
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
     HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
-    bool open(const std::string& path) {
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    bool open(const std::string& p) {
+        hFile = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
         LARGE_INTEGER fs; if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
-        return (hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL)) && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
+        return (hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL)) && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
     }
-    void close() { if (data) { UnmapViewOfFile(data); data = nullptr; } if (hMap) { CloseHandle(hMap); hMap = NULL; } if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; } }
+    void close() { if (data) UnmapViewOfFile(data); if (hMap) CloseHandle(hMap); if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile); data = nullptr; }
 #else
     int fd = -1;
-    bool open(const std::string& path) {
-        if ((fd = ::open(path.c_str(), O_RDONLY)) < 0) return false;
+    bool open(const std::string& p) {
+        if ((fd = ::open(p.c_str(), O_RDONLY)) < 0) return false;
         struct stat st; if (fstat(fd, &st) < 0 || (size = (size_t)st.st_size) == 0) { ::close(fd); return false; }
         data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data != MAP_FAILED) madvise((void*)data, size, MADV_SEQUENTIAL);
         return data != MAP_FAILED;
     }
-    void close() { if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); data = nullptr; } if (fd >= 0) { ::close(fd); fd = -1; } }
+    void close() { if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); } if (fd >= 0) ::close(fd); data = nullptr; }
 #endif
     ~MappedFile() { close(); }
 };
@@ -87,13 +87,12 @@ struct SharedEpTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
     SharedSlot slots[CAP];
     std::atomic<uint16_t> ep_count{0};
-    inline uint16_t lookup_or_insert(const char* s, uint16_t len, uint64_t h, size_t file_offset) {
+    inline uint16_t lookup_or_insert(uint16_t len, uint64_t h, size_t file_offset) {
         size_t idx = h & MASK;
         while (true) {
             uint32_t state = slots[idx].lock.load(std::memory_order_acquire);
-            if (state == 2) {
-                if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id;
-            } else if (state == 0) {
+            if (state == 2) { if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id; }
+            else if (state == 0) {
                 uint32_t expected = 0;
                 if (slots[idx].lock.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
                     uint16_t id = ep_count.fetch_add(1, std::memory_order_relaxed);
@@ -109,31 +108,15 @@ struct SharedEpTable {
             idx = (idx + 1) & MASK;
         }
     }
-    inline uint16_t lookup(uint16_t len, uint64_t h) const {
-        size_t idx = h & MASK;
-        while (true) {
-            if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id;
-            idx = (idx + 1) & MASK;
-        }
-    }
 };
 
 struct LocalEpCache {
     struct Entry { uint64_t hash; uint16_t len, id; };
-    static constexpr size_t MASK = 511;
     Entry entries[512]{};
-    inline uint16_t get_or_lookup(SharedEpTable& tbl, const char* s, uint16_t len, uint64_t h, size_t off) {
-        size_t idx = h & MASK;
+    inline uint16_t get_or_lookup(SharedEpTable& tbl, uint16_t len, uint64_t h, size_t off) {
+        size_t idx = h & 511;
         if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].id;
-        uint16_t id = tbl.lookup_or_insert(s, len, h, off);
-        entries[idx] = { h, len, id };
-        return id;
-    }
-    inline uint16_t get_or_lookup_readonly(const SharedEpTable& tbl, const char* s, uint16_t len, uint64_t h) {
-        (void)s;
-        size_t idx = h & MASK;
-        if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].id;
-        uint16_t id = tbl.lookup(len, h);
+        uint16_t id = tbl.lookup_or_insert(len, h, off);
         entries[idx] = { h, len, id };
         return id;
     }
@@ -144,6 +127,7 @@ inline int get_hour_id(const char* p) {
     return ((p[6] == '0') ? (d - 30) : (d + 1)) * 24 + h - 18;
 }
 
+struct FastLine { uint16_t ep_id; uint16_t lat_offset; };
 struct GroupQuantiles { uint32_t p50 = 0, p95 = 0, p99 = 0; };
 
 int main(int argc, char* argv[]) {
@@ -177,18 +161,16 @@ int main(int argc, char* argv[]) {
     auto atomic_errors = std::make_unique<std::atomic<uint32_t>[]>(RAW_G);
     for (size_t i = 0; i < RAW_G; ++i) { atomic_counts[i].store(0, std::memory_order_relaxed); atomic_errors[i].store(0, std::memory_order_relaxed); }
 
+    std::vector<std::vector<FastLine>> thread_lines(nthreads);
     std::vector<std::string_view> sorted_endpoints;
     std::vector<uint16_t> ep_remap;
-    size_t N = 0, G = 0;
+    size_t N = 0, G = 0, total_out_size = 0;
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
-    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_offsets, thread_output_bytes(nthreads, 0), thread_output_offsets(nthreads, 0);
     std::vector<GroupQuantiles> quantiles;
-    std::vector<size_t> thread_output_bytes(nthreads, 0), thread_output_offsets(nthreads, 0);
     std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
     std::barrier sync_point(nthreads);
-
     char* out_mmap_ptr = nullptr;
-    size_t total_out_size = 0;
 #ifdef _WIN32
     HANDLE hOutFile = INVALID_HANDLE_VALUE, hOutMap = NULL;
 #else
@@ -197,12 +179,15 @@ int main(int argc, char* argv[]) {
 
     auto worker_fn = [&](unsigned int t) {
         LocalEpCache cache;
+        auto& my_lines = thread_lines[t];
+        my_lines.reserve(std::min(size_t(280000), (chunks[t].end - chunks[t].start) / 50 + 100));
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' ');
 
         while (p < end) {
             if (p + 35 > end) break;
+            const char* line_start = p;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
             int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
             if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
@@ -212,18 +197,18 @@ int main(int argc, char* argv[]) {
             const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
             uint64_t h = hash_endpoint(ep_start, ep_len);
-            uint16_t ep_id = cache.get_or_lookup(shared_ep, ep_start, ep_len, h, ep_start - mf.data);
+            uint16_t ep_id = cache.get_or_lookup(shared_ep, ep_len, h, ep_start - mf.data);
             size_t cell = (size_t)hid * MAX_EP + ep_id;
             atomic_counts[cell].fetch_add(1, std::memory_order_relaxed);
             if (cur[1] == '5') atomic_errors[cell].fetch_add(1, std::memory_order_relaxed);
             cur += 5;
+            my_lines.push_back({ep_id, (uint16_t)(cur - line_start)});
             while (*cur != '\n') ++cur; ++cur; p = cur;
         }
         sync_point.arrive_and_wait();
 
         if (t == 0) {
-            N = shared_ep.ep_count.load(std::memory_order_relaxed);
-            G = H * N;
+            N = shared_ep.ep_count.load(std::memory_order_relaxed); G = H * N;
             struct EpRef { std::string_view sv; uint16_t orig_id; };
             std::vector<EpRef> refs(N);
             for (size_t i = 0; i < SharedEpTable::CAP; ++i) {
@@ -234,10 +219,7 @@ int main(int argc, char* argv[]) {
             }
             std::sort(refs.begin(), refs.end(), [](const EpRef& a, const EpRef& b) { return a.sv < b.sv; });
             sorted_endpoints.resize(N); ep_remap.resize(N);
-            for (uint16_t i = 0; i < N; ++i) {
-                sorted_endpoints[i] = refs[i].sv;
-                ep_remap[refs[i].orig_id] = i;
-            }
+            for (uint16_t i = 0; i < N; ++i) { sorted_endpoints[i] = refs[i].sv; ep_remap[refs[i].orig_id] = i; }
             global_counts.assign(G, 0); global_errors.assign(G, 0);
         }
         sync_point.arrive_and_wait();
@@ -250,8 +232,7 @@ int main(int argc, char* argv[]) {
                     uint32_t c = atomic_counts[base + ep].load(std::memory_order_relaxed);
                     if (c) {
                         size_t g = h * N + ep_remap[ep];
-                        global_counts[g] = c;
-                        global_errors[g] = atomic_errors[base + ep].load(std::memory_order_relaxed);
+                        global_counts[g] = c; global_errors[g] = atomic_errors[base + ep].load(std::memory_order_relaxed);
                     }
                 }
             }
@@ -265,32 +246,26 @@ int main(int argc, char* argv[]) {
             for (size_t g = 0; g < G; ++g) {
                 group_offsets[g] = (uint32_t)total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed); total += global_counts[g];
             }
-            group_offsets[G] = (uint32_t)total; all_latencies.resize(total);
-            quantiles.resize(G);
+            group_offsets[G] = (uint32_t)total; all_latencies.resize(total); quantiles.resize(G);
         }
         sync_point.arrive_and_wait();
 
         if (N == 0) return;
 
         p = mf.data + chunks[t].start; last_tag = 0; last_hid = -1;
-        while (p < end) {
-            if (p + 35 > end) break;
+        for (const auto& line : my_lines) {
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
             int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
             if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
-            const char* cur = p + 28;
-            int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
-            if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
-            const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
-            uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint64_t h = hash_endpoint(ep_start, ep_len);
-            uint16_t orig_id = cache.get_or_lookup_readonly(shared_ep, ep_start, ep_len, h);
-            cur += 5; uint32_t lat = (uint8_t)(*cur++ - '0');
-            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
-            uint32_t ggid = (uint32_t)hid * N + ep_remap[orig_id];
+            const char* lat_ptr = p + line.lat_offset;
+            uint32_t lat = (uint8_t)(*lat_ptr++ - '0');
+            while ((uint8_t)(*lat_ptr - '0') <= 9) lat = lat * 10 + (uint8_t)(*lat_ptr++ - '0');
+            uint32_t ggid = (uint32_t)hid * N + ep_remap[line.ep_id];
             all_latencies[atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed)] = lat;
-            while (*cur != '\n') ++cur; ++cur; p = cur;
+            while (*lat_ptr != '\n') ++lat_ptr;
+            p = lat_ptr + 1;
         }
+        my_lines.clear(); my_lines.shrink_to_fit();
         sync_point.arrive_and_wait();
 
         if (t == 0) atomic_write_offsets.reset();
@@ -316,11 +291,8 @@ int main(int argc, char* argv[]) {
                 }
             }
             quantiles[g] = { p50, p95, p99 };
-
-            size_t gep = g % N;
-            uint32_t errs = global_errors[g];
-            uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / n);
-            my_bytes += 20 + 1 + sorted_endpoints[gep].size() + 1 + u32_len((uint32_t)n) + 1 +
+            size_t gep = g % N; uint32_t errs = global_errors[g], ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / n);
+            my_bytes += 21 + sorted_endpoints[gep].size() + 1 + u32_len((uint32_t)n) + 1 +
                         u32_len(p50) + 1 + u32_len(p95) + 1 + u32_len(p99) + 1 +
                         u32_len(errs) + 1 + u32_len(ppm) + 1;
         }
@@ -329,11 +301,9 @@ int main(int argc, char* argv[]) {
 
         if (t == 0) {
             all_latencies.clear(); all_latencies.shrink_to_fit();
-
             size_t total_bytes = 0;
             for (unsigned int ot = 0; ot < nthreads; ++ot) {
-                thread_output_offsets[ot] = total_bytes;
-                total_bytes += thread_output_bytes[ot];
+                thread_output_offsets[ot] = total_bytes; total_bytes += thread_output_bytes[ot];
             }
             total_out_size = total_bytes;
 
@@ -359,15 +329,11 @@ int main(int argc, char* argv[]) {
         if (out_mmap_ptr) {
             char* p_out = out_mmap_ptr + thread_output_offsets[t];
             for (size_t g = g_s; g < g_e; ++g) {
-                uint32_t count = global_counts[g];
-                if (count == 0) continue;
+                uint32_t count = global_counts[g]; if (count == 0) continue;
                 size_t h = g / N, gep = g % N;
-                const auto& h_str = hour_strings[h];
-                const auto& ep = sorted_endpoints[gep];
+                const auto& h_str = hour_strings[h]; const auto& ep = sorted_endpoints[gep];
                 const auto& q = quantiles[g];
-                uint32_t errs = global_errors[g];
-                uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / count);
-
+                uint32_t errs = global_errors[g], ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / count);
                 memcpy(p_out, h_str.data(), 20); p_out += 20; *p_out++ = ' ';
                 memcpy(p_out, ep.data(), ep.size()); p_out += ep.size(); *p_out++ = ' ';
                 p_out = write_u32_fast(p_out, count); *p_out++ = ' ';
@@ -393,6 +359,5 @@ int main(int argc, char* argv[]) {
     if (out_mmap_ptr && out_mmap_ptr != MAP_FAILED) munmap(out_mmap_ptr, total_out_size);
     if (out_fd >= 0) ::close(out_fd);
 #endif
-
     return 0;
 }
