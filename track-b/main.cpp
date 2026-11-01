@@ -55,7 +55,9 @@ struct MappedFile {
         size = (size_t)st.st_size; if (size == 0) return true;
         void* p = ::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) { ::close(fd); fd = -1; return false; }
-        data = (const char*)p; return true;
+        data = (const char*)p;
+        madvise((void*)p, size, MADV_SEQUENTIAL);
+        return true;
     }
     ~MappedFile() {
         if (data && data != MAP_FAILED) munmap((void*)data, size);
@@ -197,6 +199,35 @@ struct ThreadAccumulator {
     std::vector<uint64_t> bitset;
 };
 
+struct MatchBlock {
+    static constexpr size_t CAP = 16384;
+    size_t len = 0;
+    uint32_t data[CAP];
+    MatchBlock* next = nullptr;
+};
+
+struct MatchWriter {
+    MatchBlock* head = nullptr;
+    MatchBlock* cur = nullptr;
+
+    void init() { head = cur = new MatchBlock(); }
+    inline void push_doc(uint32_t doc_id, uint32_t count, const uint32_t* term_ids) {
+        if (cur->len + 2 + count > MatchBlock::CAP) {
+            MatchBlock* nb = new MatchBlock();
+            cur->next = nb; cur = nb;
+        }
+        cur->data[cur->len++] = doc_id;
+        cur->data[cur->len++] = count;
+        memcpy(&cur->data[cur->len], term_ids, count * sizeof(uint32_t));
+        cur->len += count;
+    }
+    void clear() {
+        MatchBlock* b = head;
+        while (b) { MatchBlock* next = b->next; delete b; b = next; }
+        head = cur = nullptr;
+    }
+};
+
 int main(int argc, char** argv) {
     std::ios_base::sync_with_stdio(false);
     std::string data_dir = "/data", out_dir = "/out";
@@ -292,7 +323,7 @@ int main(int argc, char** argv) {
         N = max_id + 1;
     }
 
-    std::vector<uint32_t> doc_offsets(N), doc_lens(N);
+    std::vector<uint32_t> doc_offsets(N);
     size_t num_words = (N + 63) / 64;
 
     unsigned int hw_threads = std::thread::hardware_concurrency();
@@ -309,8 +340,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(num_query_terms, 0));
     std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_query_terms, 0));
-    std::vector<const char*> thread_chunk_start(num_threads, nullptr);
-    std::vector<const char*> thread_chunk_end(num_threads, nullptr);
+    std::vector<MatchWriter> thread_writers(num_threads);
 
     size_t chunk_bytes = docs_file.size / num_threads;
     size_t num_queries = queries.size();
@@ -322,22 +352,18 @@ int main(int argc, char** argv) {
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            // ==========================================
-            // Pass 1: Fused Boundary Scan + Document Frequency (DF) Count
-            // ==========================================
             size_t b_start = tid * chunk_bytes;
             size_t b_end = (tid == num_threads - 1) ? docs_file.size : (tid + 1) * chunk_bytes;
-
             const char* file_end = docs_file.data + docs_file.size;
             const char* p = docs_file.data + b_start;
             if (tid > 0) {
                 p = find_char_avx2(p, file_end, '\n');
                 if (p < file_end && *p == '\n') p++;
             }
-            thread_chunk_start[tid] = p;
-
             uint32_t* my_df = thread_df[tid].data();
             uint32_t doc_terms_buf[1024];
+            MatchWriter& writer = thread_writers[tid];
+            writer.init();
 
             while (p < docs_file.data + b_end && p < file_end) {
                 const char* tab_pos = find_char_avx2(p, file_end, '\t');
@@ -349,16 +375,15 @@ int main(int argc, char** argv) {
                 const char* text_start = tab_pos + 1;
                 const char* text_end = find_char_avx2(text_start, file_end, '\n');
 
-                if (doc_id < N) {
-                    doc_offsets[doc_id] = (uint32_t)(text_start - docs_file.data);
-                    doc_lens[doc_id] = (uint32_t)(text_end - text_start);
-                }
+                if (doc_id < N) doc_offsets[doc_id] = (uint32_t)(text_start - docs_file.data);
 
                 uint32_t unique_count = extract_doc_terms(text_start, text_end, term_table, doc_terms_buf);
-                for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
+                if (unique_count > 0) {
+                    for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
+                    writer.push_doc(doc_id, unique_count, doc_terms_buf);
+                }
                 p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
             }
-            thread_chunk_end[tid] = p;
 
             sync_point.arrive_and_wait();
 
@@ -391,47 +416,34 @@ int main(int argc, char** argv) {
             }
 
             sync_point.arrive_and_wait();
-
-            // ==========================================
-            // Pass 2: Stream through docs to populate bitsets & sparse postings
-            // ==========================================
             uint32_t* my_write_offsets = thread_write_offsets[tid].data();
-            p = thread_chunk_start[tid];
-            const char* my_chunk_end = thread_chunk_end[tid];
+            MatchBlock* b = writer.head;
 
-            while (p < my_chunk_end) {
-                const char* tab_pos = find_char_avx2(p, my_chunk_end, '\t');
-                if (tab_pos >= my_chunk_end) break;
+            while (b) {
+                size_t cur_pos = 0;
+                while (cur_pos < b->len) {
+                    uint32_t doc_id = b->data[cur_pos++];
+                    uint32_t count = b->data[cur_pos++];
+                    size_t word_idx = doc_id >> 6;
+                    uint64_t bit_mask = 1ULL << (doc_id & 63);
 
-                uint32_t doc_id = 0;
-                for (const char* dptr = p; dptr < tab_pos; ++dptr) doc_id = doc_id * 10 + (*dptr - '0');
-
-                const char* text_start = tab_pos + 1;
-                const char* text_end = find_char_avx2(text_start, my_chunk_end, '\n');
-
-                uint32_t unique_count = extract_doc_terms(text_start, text_end, term_table, doc_terms_buf);
-                size_t word_idx = doc_id >> 6;
-                uint64_t bit_mask = 1ULL << (doc_id & 63);
-
-                for (uint32_t j = 0; j < unique_count; ++j) {
-                    uint32_t term_id = doc_terms_buf[j];
-                    const TermInfo& ti = terms[term_id];
-                    if (ti.dense_idx != UINT32_MAX) {
-                        __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
-                    } else {
-                        sparse_postings[my_write_offsets[term_id]++] = doc_id;
+                    for (uint32_t j = 0; j < count; ++j) {
+                        uint32_t term_id = b->data[cur_pos++];
+                        const TermInfo& ti = terms[term_id];
+                        if (ti.dense_idx != UINT32_MAX) {
+                            __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
+                        } else {
+                            sparse_postings[my_write_offsets[term_id]++] = doc_id;
+                        }
                     }
                 }
-                p = (text_end < my_chunk_end && *text_end == '\n') ? text_end + 1 : my_chunk_end;
+                b = b->next;
             }
+            writer.clear();
 
             sync_point.arrive_and_wait();
             if (tid == 0) std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
             sync_point.arrive_and_wait();
-
-            // ==========================================
-            // Stage 3: Ultra-Fast Hybrid Query Execution
-            // ==========================================
             size_t q_start = tid * q_step, q_end = std::min(num_queries, (tid + 1) * q_step);
             std::string& out = thread_outputs[tid];
             out.reserve((q_end > q_start ? (q_end - q_start) : 1) * 32);
@@ -620,8 +632,10 @@ int main(int argc, char** argv) {
                     }
 
                     matches.clear(); uint64_t sum = 0; uint8_t k = q.p.num_terms;
+                    const char* file_end = docs_file.data + docs_file.size;
                     for (uint32_t doc_id : candidates) {
-                        const char* dp = docs_file.data + doc_offsets[doc_id], *text_end = dp + doc_lens[doc_id];
+                        const char* dp = docs_file.data + doc_offsets[doc_id];
+                        const char* text_end = find_char_avx2(dp, file_end, '\n');
                         uint32_t tok_count = 0; bool matched = false;
 
                         while (dp < text_end) {
