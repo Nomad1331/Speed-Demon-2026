@@ -11,14 +11,15 @@
 #include <immintrin.h>
 #include <atomic>
 #include <memory>
+#include <fcntl.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -29,6 +30,12 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     while (val >= 100) { uint32_t q = val / 100, r = val - q * 100; val = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2); }
     if (val < 10) *--b = (char)('0' + val); else { b -= 2; memcpy(b, &DIGITS_LUT[val * 2], 2); }
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
+}
+
+inline uint32_t u32_len(uint32_t v) {
+    if (v < 10) return 1; if (v < 100) return 2; if (v < 1000) return 3; if (v < 10000) return 4;
+    if (v < 100000) return 5; if (v < 1000000) return 6; if (v < 10000000) return 7;
+    if (v < 100000000) return 8; if (v < 1000000000) return 9; return 10;
 }
 
 struct MappedFile {
@@ -75,12 +82,7 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct SharedSlot {
-    std::atomic<uint32_t> lock{0};
-    uint64_t hash = 0;
-    uint32_t offset = 0;
-    uint16_t len = 0, id = 0;
-};
+struct SharedSlot { std::atomic<uint32_t> lock{0}; uint64_t hash = 0; uint32_t offset = 0; uint16_t len = 0, id = 0; };
 struct SharedEpTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
     SharedSlot slots[CAP];
@@ -160,8 +162,17 @@ int main(int argc, char* argv[]) {
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
     std::vector<size_t> group_offsets;
     std::vector<GroupQuantiles> quantiles;
+    std::vector<size_t> thread_output_bytes(nthreads, 0), thread_output_offsets(nthreads, 0);
     std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
     std::barrier sync_point(nthreads);
+
+    char* out_mmap_ptr = nullptr;
+    size_t total_out_size = 0;
+#ifdef _WIN32
+    HANDLE hOutFile = INVALID_HANDLE_VALUE, hOutMap = NULL;
+#else
+    int out_fd = -1;
+#endif
 
     auto worker_fn = [&](unsigned int t) {
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
@@ -207,7 +218,6 @@ int main(int argc, char* argv[]) {
         }
         sync_point.arrive_and_wait();
 
-        // Parallel counts remapping across threads
         if (N > 0) {
             size_t h_start = (H * t) / nthreads, h_end = (H * (t + 1)) / nthreads;
             for (size_t h = h_start; h < h_end; ++h) {
@@ -265,6 +275,7 @@ int main(int argc, char* argv[]) {
         size_t g_s = std::lower_bound(group_offsets.begin(), group_offsets.end(), t_s) - group_offsets.begin();
         size_t g_e = (t == nthreads - 1) ? G : (size_t)(std::lower_bound(group_offsets.begin(), group_offsets.end(), t_e) - group_offsets.begin());
 
+        size_t my_bytes = 0;
         for (size_t g = g_s; g < g_e; ++g) {
             size_t n = global_counts[g]; if (n == 0) continue;
             uint32_t* begin = &all_latencies[group_offsets[g]], *end_lat = begin + n, p50, p95, p99;
@@ -280,6 +291,67 @@ int main(int argc, char* argv[]) {
                 }
             }
             quantiles[g] = { p50, p95, p99 };
+
+            size_t gep = g % N;
+            uint32_t errs = global_errors[g];
+            uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / n);
+            my_bytes += 20 + 1 + sorted_endpoints[gep].size() + 1 + u32_len((uint32_t)n) + 1 +
+                        u32_len(p50) + 1 + u32_len(p95) + 1 + u32_len(p99) + 1 +
+                        u32_len(errs) + 1 + u32_len(ppm) + 1;
+        }
+        thread_output_bytes[t] = my_bytes;
+        sync_point.arrive_and_wait();
+
+        if (t == 0) {
+            all_latencies.clear(); all_latencies.shrink_to_fit();
+
+            size_t total_bytes = 0;
+            for (unsigned int ot = 0; ot < nthreads; ++ot) {
+                thread_output_offsets[ot] = total_bytes;
+                total_bytes += thread_output_bytes[ot];
+            }
+            total_out_size = total_bytes;
+
+#ifdef _WIN32
+            hOutFile = CreateFileA(out_path.string().c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hOutFile != INVALID_HANDLE_VALUE && total_bytes > 0) {
+                LARGE_INTEGER li; li.QuadPart = (LONGLONG)total_bytes;
+                SetFilePointerEx(hOutFile, li, NULL, FILE_BEGIN);
+                SetEndOfFile(hOutFile);
+                hOutMap = CreateFileMappingA(hOutFile, NULL, PAGE_READWRITE, 0, 0, NULL);
+                if (hOutMap) out_mmap_ptr = (char*)MapViewOfFile(hOutMap, FILE_MAP_WRITE, 0, 0, 0);
+            }
+#else
+            out_fd = ::open(out_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+            if (out_fd >= 0 && total_bytes > 0) {
+                ftruncate(out_fd, total_bytes);
+                out_mmap_ptr = (char*)::mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
+            }
+#endif
+        }
+        sync_point.arrive_and_wait();
+
+        if (out_mmap_ptr) {
+            char* p_out = out_mmap_ptr + thread_output_offsets[t];
+            for (size_t g = g_s; g < g_e; ++g) {
+                uint32_t count = global_counts[g];
+                if (count == 0) continue;
+                size_t h = g / N, gep = g % N;
+                const auto& h_str = hour_strings[h];
+                const auto& ep = sorted_endpoints[gep];
+                const auto& q = quantiles[g];
+                uint32_t errs = global_errors[g];
+                uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / count);
+
+                memcpy(p_out, h_str.data(), 20); p_out += 20; *p_out++ = ' ';
+                memcpy(p_out, ep.data(), ep.size()); p_out += ep.size(); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, count); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, q.p50); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, q.p95); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, q.p99); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, errs); *p_out++ = ' ';
+                p_out = write_u32_fast(p_out, ppm); *p_out++ = '\n';
+            }
         }
     };
 
@@ -288,39 +360,14 @@ int main(int argc, char* argv[]) {
     worker_fn(0);
     for (auto& w : workers) w.join();
 
-    all_latencies.clear(); all_latencies.shrink_to_fit();
+#ifdef _WIN32
+    if (out_mmap_ptr) UnmapViewOfFile(out_mmap_ptr);
+    if (hOutMap) CloseHandle(hOutMap);
+    if (hOutFile != INVALID_HANDLE_VALUE) CloseHandle(hOutFile);
+#else
+    if (out_mmap_ptr && out_mmap_ptr != MAP_FAILED) munmap(out_mmap_ptr, total_out_size);
+    if (out_fd >= 0) ::close(out_fd);
+#endif
 
-    FILE* f = fopen(out_path.string().c_str(), "wb");
-    if (!f) return 1;
-    char chunk[65536];
-    char* p = chunk;
-    char* chunk_end = chunk + sizeof(chunk) - 512;
-
-    for (size_t g = 0; g < G; ++g) {
-        uint32_t count = global_counts[g];
-        if (count == 0) continue;
-        size_t h = g / N, gep = g % N;
-        const auto& h_str = hour_strings[h];
-        const auto& ep = sorted_endpoints[gep];
-        const auto& q = quantiles[g];
-        uint32_t errs = global_errors[g];
-        uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / count);
-
-        memcpy(p, h_str.data(), h_str.size()); p += h_str.size(); *p++ = ' ';
-        memcpy(p, ep.data(), ep.size()); p += ep.size(); *p++ = ' ';
-        p = write_u32_fast(p, count); *p++ = ' ';
-        p = write_u32_fast(p, q.p50); *p++ = ' ';
-        p = write_u32_fast(p, q.p95); *p++ = ' ';
-        p = write_u32_fast(p, q.p99); *p++ = ' ';
-        p = write_u32_fast(p, errs); *p++ = ' ';
-        p = write_u32_fast(p, ppm); *p++ = '\n';
-
-        if (p >= chunk_end) {
-            fwrite(chunk, 1, p - chunk, f);
-            p = chunk;
-        }
-    }
-    if (p > chunk) fwrite(chunk, 1, p - chunk, f);
-    fclose(f);
     return 0;
 }
