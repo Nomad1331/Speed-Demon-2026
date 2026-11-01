@@ -27,7 +27,7 @@ inline char* write_u64(char* p, uint64_t v) {
     char buf[24], *b = buf + 24;
     while (v >= 100) {
         uint64_t q = v / 100; uint32_t r = (uint32_t)(v - q * 100);
-        val_assign: v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
+        v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
     }
     if (v < 10) *--b = '0' + v;
     else { b -= 2; memcpy(b, &DIGITS_LUT[v * 2], 2); }
@@ -61,7 +61,7 @@ struct alignas(8) NameSlot {
     std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
 };
 
-static constexpr size_t HASH_CAP = 1 << 18;
+static constexpr size_t HASH_CAP = 1 << 17;
 static constexpr size_t HASH_MASK = HASH_CAP - 1;
 
 struct LocalCountryAgg {
@@ -294,8 +294,11 @@ int main(int argc, char* argv[]) {
             }
             uint32_t w = cid >> 6;
             uint64_t bit = 1ULL << (cid & 63);
-            if (!(entry->seen[w].fetch_or(bit, std::memory_order_relaxed) & bit)) {
-                agg.distinct_names++;
+            uint64_t cur_seen = entry->seen[w].load(std::memory_order_relaxed);
+            if (!(cur_seen & bit)) {
+                if (!(entry->seen[w].fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                    agg.distinct_names++;
+                }
             }
         }
     };
