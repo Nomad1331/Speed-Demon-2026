@@ -94,23 +94,6 @@ inline bool mark_seen(u32 cid, u32 name_id) {
     return false;
 }
 
-
-inline u64 load8(const char* p) {
-    u64 v; memcpy(&v, p, 8); return v;
-}
-
-inline u64 fold_digits(u64 v, size_t n) {
-    v &= 0x0F0F0F0F0F0F0F0F & (~0ULL << (8 * (8 - n)));
-    v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
-    v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
-    return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
-}
-
-inline const char* find_comma(const char* p) {
-    u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
-    return p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
-}
-
 struct LocalCountryAgg {
     uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
     int64_t amount_sum = 0, amount_min = 0, amount_max = 0;
@@ -257,9 +240,9 @@ int main(int argc, char* argv[]) {
                 if (__builtin_expect((uint8_t)*ptr == 0xef, 0)) {
                     if (ptr + 3 <= chunk_end && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
                 }
-                const char* comma_id = find_comma(ptr);
-                uint64_t id = fold_digits(load8(comma_id - 8), comma_id - ptr);
-                ptr = comma_id + 1;
+                uint64_t id = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
+                ptr++;
                 uint32_t crc = 0; size_t name_len = 0;
                 if (__builtin_expect(*ptr == '"', 1)) {
                     ptr++;
@@ -343,15 +326,13 @@ int main(int argc, char* argv[]) {
                 }
             note_done:
 
-                const char* comma_reg = find_comma(ptr);
-                uint32_t region_id = (uint32_t)fold_digits(load8(comma_reg - 8), comma_reg - ptr);
-                ptr = comma_reg + 1;
+                uint32_t region_id = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
+                ptr++;
                 bool neg = (*ptr == '-'); ptr += neg;
-                const char* s_amt = ptr;
-                while (*ptr != '\r' && *ptr != '\n') ptr++;
-                uint64_t w_amt = load8(ptr - 8);
-                uint64_t amt_v = (w_amt & 0xFFFFFFFFFFULL) << 8 | (w_amt & 0xFFFF000000000000ULL);
-                int64_t cents = (int64_t)fold_digits(amt_v, (ptr - s_amt) - 1);
+                int64_t cents = (uint8_t)(*ptr++ - '0');
+                while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
+                ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
                 if (neg) cents = -cents;
                 if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
 

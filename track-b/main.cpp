@@ -555,7 +555,9 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
                 u32 doc = first;
                 for (const uint8_t* p = begin; p < stop; ++doc) {
                     const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
-                    const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
+                    const uint8_t* tx = p;
+                    while (*tx != '\t') ++tx;
+                    ++tx;
                     ix.text[doc] = tx - base;
                     for_each_token(tx, nl, terms, [&](u32 id, const uint8_t* s) { f(id, s, doc); });
                     p = nl + 1;
@@ -688,6 +690,7 @@ inline size_t gallop(const u32* a, size_t lo, size_t n, u32 x) {
 // and when one side is far smaller we gallop through the larger one instead.
 void op_and(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
     out.clear();
+    out.reserve(std::min(a.size(), b.n));
     if (b.bits) {
         for (u32 x : a)
             if (has(b.bits, x)) out.push_back(x);
@@ -712,6 +715,7 @@ void op_and(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
 
 void op_not(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
     out.clear();
+    out.reserve(a.size());
     if (b.bits) {
         for (u32 x : a)
             if (!has(b.bits, x)) out.push_back(x);
@@ -728,6 +732,7 @@ void op_not(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
 
 void op_or(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
     out.clear();
+    out.reserve(a.size() + b.n);
     std::set_union(a.begin(), a.end(), b.p, b.p + b.n, std::back_inserter(out));
 }
 
