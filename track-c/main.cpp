@@ -55,7 +55,7 @@ struct alignas(8) NameSlot {
     std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
 };
 
-static constexpr size_t HASH_CAP = 1 << 18;
+static constexpr size_t HASH_CAP = 1 << 17;
 static constexpr size_t HASH_MASK = HASH_CAP - 1;
 
 struct LocalCountryAgg {
@@ -337,6 +337,5 @@ int main(int argc, char* argv[]) {
         fwrite(out_buf, 1, (size_t)(p_out - out_buf), out_file);
         fclose(out_file);
     }
-    munmap(name_table, sizeof(NameSlot) * HASH_CAP);
-    return 0;
+    _exit(0);
 }
