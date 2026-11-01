@@ -1,3 +1,6 @@
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #pragma GCC optimize("O3,unroll-loops")
 #pragma GCC target("avx2,bmi,bmi2,popcnt")
 #include <algorithm>
@@ -177,6 +180,9 @@ static const char* find_boundary(const char* p, const char* data_end, const char
 }
 
 int main(int argc, char* argv[]) {
+#ifdef __linux__
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
     std::string data_dir = "/data", out_arg = "/out";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) data_dir = argv[++i];
@@ -190,7 +196,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint16_t> code_to_cid(26 * 26 * 26, 0xFFFF);
     std::vector<std::string> countries;
-    std::vector<uint16_t> region_to_country(1'000'001, 0);
+    std::vector<uint8_t> region_to_country(1'000'001, 0);
 
     const char* rp = reg_file.data, *rend = rp + reg_file.size;
     while (rp < rend && *rp++ != '\n') {}
@@ -202,7 +208,7 @@ int main(int argc, char* argv[]) {
         if (cid == 0xFFFF) { cid = static_cast<uint16_t>(countries.size()); countries.emplace_back(rp, 3); }
         rp += 3;
         while (rp < rend && (*rp == '\r' || *rp == '\n')) ++rp;
-        if (region < region_to_country.size()) region_to_country[region] = static_cast<uint16_t>(cid + 1);
+        if (region < region_to_country.size()) region_to_country[region] = static_cast<uint8_t>(cid + 1);
     }
 
     const uint16_t unmatched_cid = static_cast<uint16_t>(countries.size());
@@ -211,6 +217,7 @@ int main(int argc, char* argv[]) {
 
     Mapping rec_file;
     if (!rec_file.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
+    madvise((void*)rec_file.data, rec_file.size, MADV_WILLNEED | MADV_SEQUENTIAL);
 
     const char* recs = rec_file.data, *recs_end = recs + rec_file.size;
     if (recs_end - recs >= 3 && static_cast<unsigned char>(recs[0]) == 0xef && static_cast<unsigned char>(recs[1]) == 0xbb && static_cast<unsigned char>(recs[2]) == 0xbf) recs += 3;
@@ -229,7 +236,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::vector<WorkerCountryAgg>> partial(WORKERS, std::vector<WorkerCountryAgg>(n_countries));
 
-    constexpr uint32_t NAME_SLOTS = 1u << 18, ROW_WORDS = NAME_SLOTS / 64;
+    constexpr uint32_t NAME_SLOTS = 1u << 17, ROW_WORDS = NAME_SLOTS / 64;
     auto* const name_table = static_cast<std::atomic<uint64_t>*>(std::calloc(NAME_SLOTS, sizeof(uint64_t)));
     auto* const seen = static_cast<std::atomic<uint64_t>*>(std::calloc(n_countries * ROW_WORDS, sizeof(uint64_t)));
 
@@ -246,7 +253,7 @@ int main(int argc, char* argv[]) {
         auto drain = [&]() {
             for (unsigned i = 0; i < nb; ++i) {
                 Rec& r = batch[i];
-                const uint16_t mapped = (r.region < region_to_country.size()) ? region_to_country[r.region] : 0;
+                const uint8_t mapped = (r.region < region_to_country.size()) ? region_to_country[r.region] : 0;
                 r.group = mapped ? static_cast<uint32_t>(mapped - 1) : unmatched_cid;
                 uint32_t slot = static_cast<uint32_t>(r.hash) & (NAME_SLOTS - 1);
                 for (;;) {
