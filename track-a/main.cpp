@@ -12,16 +12,9 @@
 #include <atomic>
 #include <memory>
 #include <fcntl.h>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <io.h>
-#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 static const char DIGITS_LUT[] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 inline char* write_u32_fast(char* p, uint32_t val) {
@@ -31,7 +24,6 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) *--b = (char)('0' + val); else { b -= 2; memcpy(b, &DIGITS_LUT[val * 2], 2); }
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
 }
-
 inline uint32_t u32_len(uint32_t v) {
     if (v < 10) return 1; if (v < 100) return 2; if (v < 1000) return 3; if (v < 10000) return 4;
     if (v < 100000) return 5; if (v < 1000000) return 6; if (v < 10000000) return 7;
@@ -39,27 +31,18 @@ inline uint32_t u32_len(uint32_t v) {
 }
 
 struct MappedFile {
-    const char* data = nullptr; size_t size = 0;
-#ifdef _WIN32
-    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
-    bool open(const std::string& p) {
-        hFile = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER fs; if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
-        return (hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL)) && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-    }
-    void close() { if (data) UnmapViewOfFile(data); if (hMap) CloseHandle(hMap); if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile); data = nullptr; }
-#else
-    int fd = -1;
+    const char* data = nullptr; size_t size = 0; int fd = -1;
     bool open(const std::string& p) {
         if ((fd = ::open(p.c_str(), O_RDONLY)) < 0) return false;
-        struct stat st; if (fstat(fd, &st) < 0 || (size = (size_t)st.st_size) == 0) { ::close(fd); return false; }
+        struct stat st; if (fstat(fd, &st) < 0 || (size = (size_t)st.st_size) == 0) { ::close(fd); fd = -1; return false; }
         data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data != MAP_FAILED) madvise((void*)data, size, MADV_SEQUENTIAL);
         return data != MAP_FAILED;
     }
-    void close() { if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); } if (fd >= 0) ::close(fd); data = nullptr; }
-#endif
+    void close() {
+        if (data && data != MAP_FAILED) { madvise((void*)data, size, MADV_DONTNEED); munmap((void*)data, size); }
+        if (fd >= 0) ::close(fd); data = nullptr; fd = -1;
+    }
     ~MappedFile() { close(); }
 };
 
@@ -81,7 +64,7 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
     return h ? h : 1;
 }
 
-static constexpr size_t MAX_EP = 2048, MAX_H = 72;
+static constexpr size_t MAX_EP = 2048, H = 72, RAW_G = H * MAX_EP;
 struct SharedSlot { std::atomic<uint32_t> lock{0}; uint64_t hash = 0; uint32_t offset = 0; uint16_t len = 0, id = 0; };
 struct SharedEpTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
@@ -93,8 +76,8 @@ struct SharedEpTable {
             uint32_t state = slots[idx].lock.load(std::memory_order_acquire);
             if (state == 2) { if (slots[idx].hash == h && slots[idx].len == len) return slots[idx].id; }
             else if (state == 0) {
-                uint32_t expected = 0;
-                if (slots[idx].lock.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+                uint32_t exp = 0;
+                if (slots[idx].lock.compare_exchange_strong(exp, 1, std::memory_order_relaxed)) {
                     uint16_t id = ep_count.fetch_add(1, std::memory_order_relaxed);
                     slots[idx].hash = h; slots[idx].offset = (uint32_t)file_offset; slots[idx].len = len; slots[idx].id = id;
                     slots[idx].lock.store(2, std::memory_order_release);
@@ -111,14 +94,12 @@ struct SharedEpTable {
 };
 
 struct LocalEpCache {
-    struct Entry { uint64_t hash; uint16_t len, id; };
-    Entry entries[512]{};
+    struct Entry { uint64_t hash; uint16_t len, id; } entries[512]{};
     inline uint16_t get_or_lookup(SharedEpTable& tbl, uint16_t len, uint64_t h, size_t off) {
         size_t idx = h & 511;
         if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].id;
         uint16_t id = tbl.lookup_or_insert(len, h, off);
-        entries[idx] = { h, len, id };
-        return id;
+        entries[idx] = { h, len, id }; return id;
     }
 };
 
@@ -127,7 +108,6 @@ inline int get_hour_id(const char* p) {
     return ((p[6] == '0') ? (d - 30) : (d + 1)) * 24 + h - 18;
 }
 
-struct FastLine { uint16_t ep_id; uint16_t lat_offset; };
 struct GroupQuantiles { uint32_t p50 = 0, p95 = 0, p99 = 0; };
 
 int main(int argc, char* argv[]) {
@@ -139,9 +119,12 @@ int main(int argc, char* argv[]) {
     std::filesystem::path in_path = std::filesystem::path(data_dir) / "requests.log", out_path = std::filesystem::path(out_dir) / "summary.txt";
     std::filesystem::create_directories(out_dir);
     MappedFile mf;
-    if (!mf.open(in_path.string()) || mf.size == 0) { FILE* f = fopen(out_path.string().c_str(), "wb"); if (f) fclose(f); return 0; }
+    if (!mf.open(in_path.string()) || mf.size == 0) {
+        int fd = ::open(out_path.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) ::close(fd);
+        return 0;
+    }
 
-    static const size_t H = 72;
     std::string hour_strings[H];
     { size_t idx = 0; auto add_h = [&](const char* pr, int s, int e) { for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; } };
       add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17); }
@@ -156,38 +139,31 @@ int main(int argc, char* argv[]) {
         chunks[i] = {s, e};
     }
     SharedEpTable shared_ep;
-    static constexpr size_t RAW_G = H * MAX_EP;
-    auto atomic_counts = std::make_unique<std::atomic<uint32_t>[]>(RAW_G);
+    auto thread_data = std::make_unique<uint32_t[]>(nthreads * RAW_G);
+    memset(thread_data.get(), 0, nthreads * RAW_G * sizeof(uint32_t));
     auto atomic_errors = std::make_unique<std::atomic<uint32_t>[]>(RAW_G);
-    for (size_t i = 0; i < RAW_G; ++i) { atomic_counts[i].store(0, std::memory_order_relaxed); atomic_errors[i].store(0, std::memory_order_relaxed); }
+    for (size_t i = 0; i < RAW_G; ++i) atomic_errors[i].store(0, std::memory_order_relaxed);
 
-    std::vector<std::vector<FastLine>> thread_lines(nthreads);
     std::vector<std::string_view> sorted_endpoints;
-    std::vector<uint16_t> ep_remap;
+    std::vector<uint16_t> sorted_to_orig;
     size_t N = 0, G = 0, total_out_size = 0;
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
     std::vector<size_t> group_offsets, thread_output_bytes(nthreads, 0), thread_output_offsets(nthreads, 0);
+    std::vector<uint32_t> thread_hour_totals(nthreads, 0), thread_hour_offsets(nthreads, 0);
     std::vector<GroupQuantiles> quantiles;
-    std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
     std::barrier sync_point(nthreads);
     char* out_mmap_ptr = nullptr;
-#ifdef _WIN32
-    HANDLE hOutFile = INVALID_HANDLE_VALUE, hOutMap = NULL;
-#else
     int out_fd = -1;
-#endif
 
     auto worker_fn = [&](unsigned int t) {
         LocalEpCache cache;
-        auto& my_lines = thread_lines[t];
-        my_lines.reserve(std::min(size_t(280000), (chunks[t].end - chunks[t].start) / 50 + 100));
+        uint32_t* my_counts = thread_data.get() + t * RAW_G;
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' ');
 
         while (p < end) {
             if (p + 35 > end) break;
-            const char* line_start = p;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
             int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
             if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
@@ -199,11 +175,11 @@ int main(int argc, char* argv[]) {
             uint64_t h = hash_endpoint(ep_start, ep_len);
             uint16_t ep_id = cache.get_or_lookup(shared_ep, ep_len, h, ep_start - mf.data);
             size_t cell = (size_t)hid * MAX_EP + ep_id;
-            atomic_counts[cell].fetch_add(1, std::memory_order_relaxed);
+            my_counts[cell]++;
             if (cur[1] == '5') atomic_errors[cell].fetch_add(1, std::memory_order_relaxed);
             cur += 5;
-            my_lines.push_back({ep_id, (uint16_t)(cur - line_start)});
-            while (*cur != '\n') ++cur; ++cur; p = cur;
+            while (*cur != '\n') ++cur;
+            p = cur + 1;
         }
         sync_point.arrive_and_wait();
 
@@ -218,57 +194,82 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::sort(refs.begin(), refs.end(), [](const EpRef& a, const EpRef& b) { return a.sv < b.sv; });
-            sorted_endpoints.resize(N); ep_remap.resize(N);
-            for (uint16_t i = 0; i < N; ++i) { sorted_endpoints[i] = refs[i].sv; ep_remap[refs[i].orig_id] = i; }
-            global_counts.assign(G, 0); global_errors.assign(G, 0);
+            sorted_endpoints.resize(N); sorted_to_orig.resize(N);
+            for (uint16_t i = 0; i < N; ++i) { sorted_endpoints[i] = refs[i].sv; sorted_to_orig[i] = refs[i].orig_id; }
+            global_counts.assign(G, 0); global_errors.assign(G, 0); group_offsets.resize(G + 1, 0);
         }
         sync_point.arrive_and_wait();
 
-        if (N > 0) {
-            size_t h_start = (H * t) / nthreads, h_end = (H * (t + 1)) / nthreads;
+        size_t h_start = (H * t) / nthreads, h_end = (H * (t + 1)) / nthreads;
+        uint32_t my_h_total = 0;
+        for (size_t h = h_start; h < h_end; ++h) {
+            for (size_t ep = 0; ep < N; ++ep) {
+                uint16_t orig_id = sorted_to_orig[ep];
+                size_t cell = h * MAX_EP + orig_id, g = h * N + ep;
+                group_offsets[g] = my_h_total;
+                uint32_t g_count = 0;
+                for (unsigned int ot = 0; ot < nthreads; ++ot) {
+                    size_t idx = ot * RAW_G + cell;
+                    uint32_t c = thread_data[idx];
+                    thread_data[idx] = my_h_total + g_count;
+                    g_count += c;
+                }
+                global_counts[g] = g_count;
+                global_errors[g] = atomic_errors[cell].load(std::memory_order_relaxed);
+                my_h_total += g_count;
+            }
+        }
+        thread_hour_totals[t] = my_h_total;
+        sync_point.arrive_and_wait();
+
+        if (t == 0) {
+            uint32_t run = 0;
+            for (unsigned int ot = 0; ot < nthreads; ++ot) { thread_hour_offsets[ot] = run; run += thread_hour_totals[ot]; }
+            group_offsets[G] = run; all_latencies.resize(run); quantiles.resize(G);
+        }
+        sync_point.arrive_and_wait();
+
+        uint32_t h_base = thread_hour_offsets[t];
+        if (h_base > 0) {
             for (size_t h = h_start; h < h_end; ++h) {
-                size_t base = h * MAX_EP;
                 for (size_t ep = 0; ep < N; ++ep) {
-                    uint32_t c = atomic_counts[base + ep].load(std::memory_order_relaxed);
-                    if (c) {
-                        size_t g = h * N + ep_remap[ep];
-                        global_counts[g] = c; global_errors[g] = atomic_errors[base + ep].load(std::memory_order_relaxed);
-                    }
+                    uint16_t orig_id = sorted_to_orig[ep];
+                    size_t cell = h * MAX_EP + orig_id, g = h * N + ep;
+                    group_offsets[g] += h_base;
+                    for (unsigned int ot = 0; ot < nthreads; ++ot) thread_data[ot * RAW_G + cell] += h_base;
                 }
             }
         }
         sync_point.arrive_and_wait();
 
-        if (t == 0) {
-            atomic_counts.reset(); atomic_errors.reset();
-            group_offsets.resize(G + 1, 0); atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
-            size_t total = 0;
-            for (size_t g = 0; g < G; ++g) {
-                group_offsets[g] = (uint32_t)total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed); total += global_counts[g];
+        if (N > 0) {
+            uint32_t* my_offsets = thread_data.get() + t * RAW_G;
+            LocalEpCache cache2;
+            p = mf.data + chunks[t].start; last_tag = 0; last_hid = -1;
+            while (p < end) {
+                if (p + 35 > end) break;
+                uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
+                int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
+                if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
+                const char* cur = p + 28;
+                int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
+                if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
+                const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
+                uint16_t ep_len = (uint16_t)(cur - ep_start);
+                uint64_t h = hash_endpoint(ep_start, ep_len);
+                uint16_t ep_id = cache2.get_or_lookup(shared_ep, ep_len, h, ep_start - mf.data);
+                size_t cell = (size_t)hid * MAX_EP + ep_id;
+                cur += 5;
+                uint32_t lat = (uint8_t)(*cur++ - '0');
+                while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
+                all_latencies[my_offsets[cell]++] = lat;
+                while (*cur != '\n') ++cur;
+                p = cur + 1;
             }
-            group_offsets[G] = (uint32_t)total; all_latencies.resize(total); quantiles.resize(G);
         }
         sync_point.arrive_and_wait();
 
-        if (N == 0) return;
-
-        p = mf.data + chunks[t].start; last_tag = 0; last_hid = -1;
-        for (const auto& line : my_lines) {
-            uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
-            int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
-            if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
-            const char* lat_ptr = p + line.lat_offset;
-            uint32_t lat = (uint8_t)(*lat_ptr++ - '0');
-            while ((uint8_t)(*lat_ptr - '0') <= 9) lat = lat * 10 + (uint8_t)(*lat_ptr++ - '0');
-            uint32_t ggid = (uint32_t)hid * N + ep_remap[line.ep_id];
-            all_latencies[atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed)] = lat;
-            while (*lat_ptr != '\n') ++lat_ptr;
-            p = lat_ptr + 1;
-        }
-        my_lines.clear(); my_lines.shrink_to_fit();
-        sync_point.arrive_and_wait();
-
-        if (t == 0) atomic_write_offsets.reset();
+        if (t == 0) { thread_data.reset(); atomic_errors.reset(); }
 
         size_t total_lines = group_offsets[G];
         size_t t_s = (total_lines * t) / nthreads, t_e = (total_lines * (t + 1)) / nthreads;
@@ -306,27 +307,15 @@ int main(int argc, char* argv[]) {
                 thread_output_offsets[ot] = total_bytes; total_bytes += thread_output_bytes[ot];
             }
             total_out_size = total_bytes;
-
-#ifdef _WIN32
-            hOutFile = CreateFileA(out_path.string().c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hOutFile != INVALID_HANDLE_VALUE && total_bytes > 0) {
-                LARGE_INTEGER li; li.QuadPart = (LONGLONG)total_bytes;
-                SetFilePointerEx(hOutFile, li, NULL, FILE_BEGIN);
-                SetEndOfFile(hOutFile);
-                hOutMap = CreateFileMappingA(hOutFile, NULL, PAGE_READWRITE, 0, 0, NULL);
-                if (hOutMap) out_mmap_ptr = (char*)MapViewOfFile(hOutMap, FILE_MAP_WRITE, 0, 0, 0);
-            }
-#else
             out_fd = ::open(out_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
             if (out_fd >= 0 && total_bytes > 0) {
                 ftruncate(out_fd, total_bytes);
                 out_mmap_ptr = (char*)::mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
             }
-#endif
         }
         sync_point.arrive_and_wait();
 
-        if (out_mmap_ptr) {
+        if (out_mmap_ptr && out_mmap_ptr != MAP_FAILED) {
             char* p_out = out_mmap_ptr + thread_output_offsets[t];
             for (size_t g = g_s; g < g_e; ++g) {
                 uint32_t count = global_counts[g]; if (count == 0) continue;
@@ -351,13 +340,7 @@ int main(int argc, char* argv[]) {
     worker_fn(0);
     for (auto& w : workers) w.join();
 
-#ifdef _WIN32
-    if (out_mmap_ptr) UnmapViewOfFile(out_mmap_ptr);
-    if (hOutMap) CloseHandle(hOutMap);
-    if (hOutFile != INVALID_HANDLE_VALUE) CloseHandle(hOutFile);
-#else
     if (out_mmap_ptr && out_mmap_ptr != MAP_FAILED) munmap(out_mmap_ptr, total_out_size);
     if (out_fd >= 0) ::close(out_fd);
-#endif
     return 0;
 }
