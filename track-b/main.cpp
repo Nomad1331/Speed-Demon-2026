@@ -471,6 +471,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 total_sparse_postings = cur_sparse_offset;
+                std::vector<std::vector<uint32_t>>().swap(thread_df);
 
                 size_t dense_u64 = (size_t)num_dense_terms * num_words;
                 dense_bitsets = (uint64_t*)calloc(dense_u64 > 0 ? dense_u64 : 1, sizeof(uint64_t));
@@ -547,11 +548,13 @@ int main(int argc, char** argv) {
             sync_point.arrive_and_wait();
             if (tid == 0) {
                 if (profile) t_pass2 = std::chrono::high_resolution_clock::now();
+                std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
 #ifndef _WIN32
                 // Ensure all mapped file pages are dropped from process RSS
                 madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
 #endif
             }
+            sync_point.arrive_and_wait();
 
             // ==========================================
             // Stage 3: Ultra-Fast Hybrid Query Execution

@@ -74,9 +74,7 @@ int main(int argc, char* argv[]) {
     }
     std::filesystem::path out_path = out_arg.ends_with(".txt") ? std::filesystem::path(out_arg) : std::filesystem::path(out_arg) / "aggregates.txt";
     std::filesystem::create_directories(out_path.parent_path());
-
-    MappedFile mf_regions;
-    if (!mf_regions.open((std::filesystem::path(data_dir) / "regions.csv").string())) return 1;
+    MappedFile mf_regions; if (!mf_regions.open((std::filesystem::path(data_dir) / "regions.csv").string())) return 1;
     const char* rptr = mf_regions.data, *rend = mf_regions.data + mf_regions.size;
     while (rptr < rend && *rptr != '\n') rptr++;
     if (rptr < rend && *rptr == '\n') rptr++;
@@ -117,16 +115,12 @@ int main(int argc, char* argv[]) {
     if (mf_regions.size > 0) madvise((void*)mf_regions.data, mf_regions.size, MADV_DONTNEED);
 #endif
 
-    MappedFile mf_records;
-    if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
+    MappedFile mf_records; if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
     const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
     if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
-    while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
-    if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
+    while (ptr0 < file_end && *ptr0 != '\n') ptr0++; if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
 
-    unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
-    if (mf_records.size < 200000) nthreads = 1;
-
+    unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u); if (mf_records.size < 200000) nthreads = 1;
     std::vector<Chunk> chunks(nthreads);
     chunks[0].start = ptr0;
     if (nthreads == 1) chunks[0].end = file_end;
@@ -152,10 +146,7 @@ int main(int argc, char* argv[]) {
         chunks[nthreads - 1].end = file_end;
     }
 
-    uint8_t out_order[241];
-    for (uint16_t i = 0; i < num_countries; ++i) out_order[i] = (uint8_t)(i + 1);
-    out_order[num_countries] = 0;
-
+    uint8_t out_order[241]; for (uint16_t i = 0; i < num_countries; ++i) out_order[i] = (uint8_t)(i + 1); out_order[num_countries] = 0;
     std::vector<ThreadData> tdata(nthreads); std::barrier sync_point(nthreads);
 
     auto worker_fn = [&](unsigned int t) {
@@ -171,6 +162,10 @@ int main(int argc, char* argv[]) {
                 if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
 #endif
                 last_evicted = ptr;
+                for (uint16_t c = 0; c <= num_countries; ++c) {
+                    auto& v = my_names[c];
+                    if (v.size() > 64) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); }
+                }
             }
             if (ptr + 3 <= chunk_end && (uint8_t)ptr[0] == 0xef && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
 
@@ -247,7 +242,7 @@ int main(int argc, char* argv[]) {
 
         for (uint16_t c = 0; c <= num_countries; ++c) {
             auto& v = my_names[c];
-            if (!v.empty()) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); }
+            if (!v.empty()) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); v.shrink_to_fit(); }
         }
 
 #ifndef _WIN32
@@ -270,8 +265,9 @@ int main(int argc, char* argv[]) {
                 count += o.count; id_sum += o.id_sum; amt_sum += o.amount_sum;
                 amt_min = std::min(amt_min, o.amount_min); amt_max = std::max(amt_max, o.amount_max);
                 name_bytes += o.name_bytes; note_bytes += o.note_bytes;
-                const auto& nms = tdata[ot].country_names[c];
+                auto& nms = tdata[ot].country_names[c];
                 all_names.insert(all_names.end(), nms.begin(), nms.end());
+                std::vector<uint64_t>().swap(nms);
             }
             if (!count) continue;
 
