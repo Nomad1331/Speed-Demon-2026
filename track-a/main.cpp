@@ -41,7 +41,7 @@ inline uint32_t u32_len(uint32_t v) {
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
-    int fd = -1; HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
+    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
     bool open(const std::string& path) {
         hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
@@ -118,6 +118,27 @@ struct SharedEpTable {
     }
 };
 
+struct LocalEpCache {
+    struct Entry { uint64_t hash; uint16_t len, id; };
+    static constexpr size_t MASK = 511;
+    Entry entries[512]{};
+    inline uint16_t get_or_lookup(SharedEpTable& tbl, const char* s, uint16_t len, uint64_t h, size_t off) {
+        size_t idx = h & MASK;
+        if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].id;
+        uint16_t id = tbl.lookup_or_insert(s, len, h, off);
+        entries[idx] = { h, len, id };
+        return id;
+    }
+    inline uint16_t get_or_lookup_readonly(const SharedEpTable& tbl, const char* s, uint16_t len, uint64_t h) {
+        (void)s;
+        size_t idx = h & MASK;
+        if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].id;
+        uint16_t id = tbl.lookup(len, h);
+        entries[idx] = { h, len, id };
+        return id;
+    }
+};
+
 inline int get_hour_id(const char* p) {
     int d = (p[8] - '0') * 10 + (p[9] - '0'), h = (p[11] - '0') * 10 + (p[12] - '0');
     return ((p[6] == '0') ? (d - 30) : (d + 1)) * 24 + h - 18;
@@ -175,6 +196,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     auto worker_fn = [&](unsigned int t) {
+        LocalEpCache cache;
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' ');
@@ -189,10 +211,12 @@ int main(int argc, char* argv[]) {
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
             const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint16_t ep_id = shared_ep.lookup_or_insert(ep_start, ep_len, hash_endpoint(ep_start, ep_len), ep_start - mf.data);
+            uint64_t h = hash_endpoint(ep_start, ep_len);
+            uint16_t ep_id = cache.get_or_lookup(shared_ep, ep_start, ep_len, h, ep_start - mf.data);
             size_t cell = (size_t)hid * MAX_EP + ep_id;
             atomic_counts[cell].fetch_add(1, std::memory_order_relaxed);
             if (cur[1] == '5') atomic_errors[cell].fetch_add(1, std::memory_order_relaxed);
+            cur += 5;
             while (*cur != '\n') ++cur; ++cur; p = cur;
         }
         sync_point.arrive_and_wait();
@@ -259,7 +283,8 @@ int main(int argc, char* argv[]) {
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
             const char* ep_start = cur; cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint16_t orig_id = shared_ep.lookup(ep_len, hash_endpoint(ep_start, ep_len));
+            uint64_t h = hash_endpoint(ep_start, ep_len);
+            uint16_t orig_id = cache.get_or_lookup_readonly(shared_ep, ep_start, ep_len, h);
             cur += 5; uint32_t lat = (uint8_t)(*cur++ - '0');
             while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
             uint32_t ggid = (uint32_t)hid * N + ep_remap[orig_id];
