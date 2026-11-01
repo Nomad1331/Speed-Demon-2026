@@ -18,6 +18,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
 static const char DIGITS_LUT[] = 
     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
@@ -49,90 +53,90 @@ inline const char* find_char_avx2(const char* p, const char* end, char target) {
 struct MappedFile {
     const char* data = nullptr; size_t size = 0; int fd = -1;
     bool open(const std::string& path) {
-        fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) return false;
+        fd = ::open(path.c_str(), O_RDONLY | O_BINARY); if (fd < 0) return false;
         struct stat st; if (fstat(fd, &st) < 0) { ::close(fd); fd = -1; return false; }
         size = (size_t)st.st_size; if (size == 0) return true;
         void* p = ::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) { ::close(fd); fd = -1; return false; }
         data = (const char*)p;
-        madvise((void*)p, size, MADV_SEQUENTIAL);
         return true;
     }
-    ~MappedFile() {
-        if (data && data != MAP_FAILED) munmap((void*)data, size);
-        if (fd >= 0) ::close(fd);
+    void close() {
+        if (data && data != MAP_FAILED) { ::munmap((void*)data, size); data = nullptr; }
+        if (fd >= 0) { ::close(fd); fd = -1; }
     }
+    ~MappedFile() { close(); }
 };
 
-alignas(64) static uint8_t CHAR_MAP[256];
-static void init_char_map() {
-    memset(CHAR_MAP, 0, sizeof(CHAR_MAP));
+static uint8_t CHAR_MAP[256];
+inline void init_char_map() {
+    static bool inited = false; if (inited) return; inited = true;
+    memset(CHAR_MAP, 0, 256);
     for (int c = '0'; c <= '9'; ++c) CHAR_MAP[c] = (uint8_t)c;
     for (int c = 'a'; c <= 'z'; ++c) CHAR_MAP[c] = (uint8_t)c;
-    for (int c = 'A'; c <= 'Z'; ++c) CHAR_MAP[c] = (uint8_t)(c + ('a' - 'A'));
+    for (int c = 'A'; c <= 'Z'; ++c) CHAR_MAP[c] = (uint8_t)(c + 32);
 }
 
-struct Lut16Entry { uint8_t count; uint16_t sum; };
-alignas(64) static Lut16Entry LUT16[65536];
-static void init_lut16() {
+struct PopcountLUT { uint8_t count; uint32_t sum; };
+static PopcountLUT LUT16[65536];
+inline void init_lut16() {
+    static bool inited = false; if (inited) return; inited = true;
     for (uint32_t i = 0; i < 65536; ++i) {
-        uint8_t c = 0; uint16_t s = 0;
-        for (int b = 0; b < 16; ++b) { if ((i >> b) & 1) { c++; s += (uint16_t)b; } }
-        LUT16[i].count = c; LUT16[i].sum = s;
+        uint8_t cnt = 0; uint32_t sm = 0;
+        for (int b = 0; b < 16; ++b) { if ((i >> b) & 1) { cnt++; sm += b; } }
+        LUT16[i] = { cnt, sm };
     }
 }
-
-alignas(64) static uint64_t FILTER_BITMAP[16384];
 
 inline uint32_t compute_crc(const char* s, uint32_t len) {
-    uint32_t c = 0;
-    for (uint32_t i = 0; i < len; ++i) c = _mm_crc32_u8(c, (uint8_t)s[i]);
-    return c;
+    uint32_t crc = 0;
+    for (uint32_t i = 0; i < len; ++i) crc = _mm_crc32_u8(crc, (uint8_t)s[i]);
+    return crc;
 }
 
-inline bool tokens_equal(const char* query_str, const char* doc_tok, uint32_t len) {
-    for (uint32_t i = 0; i < len; ++i) {
-        if ((char)CHAR_MAP[(unsigned char)doc_tok[i]] != query_str[i]) return false;
-    }
+inline bool tokens_equal(const char* t1, uint32_t l1, const char* t2, uint32_t l2) {
+    if (l1 != l2) return false;
+    for (uint32_t i = 0; i < l1; ++i) if ((char)CHAR_MAP[(unsigned char)t1[i]] != (char)CHAR_MAP[(unsigned char)t2[i]]) return false;
     return true;
 }
 
-struct TermSlot { uint32_t hash = 0, term_id = 0, len = 0; const char* str = nullptr; };
+static uint64_t FILTER_BITMAP[16384];
+
+struct TermSlot {
+    uint32_t hash = 0, term_id = UINT32_MAX, len = 0;
+    std::string text;
+};
+
 struct TermTable {
-    TermSlot* slots = nullptr;
-    uint32_t capacity = 0, mask = 0, num_terms = 0;
-    std::vector<std::string_view> term_strings;
+    std::vector<TermSlot> slots;
+    uint32_t mask = 0, num_terms = 0;
 
-    void init(uint32_t expected_terms) {
-        capacity = 16;
-        while (capacity < expected_terms * 4) capacity *= 2;
-        if (capacity < 1024) capacity = 1024;
-        mask = capacity - 1;
-        slots = (TermSlot*)calloc(capacity, sizeof(TermSlot));
+    void init(size_t cap) {
+        size_t sz = 1; while (sz < cap) sz <<= 1;
+        slots.resize(sz); mask = (uint32_t)(sz - 1); num_terms = 0;
     }
-    ~TermTable() { if (slots) free(slots); }
-
-    uint32_t get_or_insert(const char* s, uint32_t len, uint32_t crc) {
+    inline uint32_t get_or_insert(const char* s, uint32_t len, uint32_t crc) {
         uint32_t idx = crc & mask;
-        while (slots[idx].str != nullptr) {
-            if (slots[idx].hash == crc && slots[idx].len == len && memcmp(slots[idx].str, s, len) == 0)
+        while (true) {
+            if (slots[idx].term_id == UINT32_MAX) {
+                slots[idx].hash = crc; slots[idx].len = len; slots[idx].term_id = num_terms++;
+                slots[idx].text.assign(s, len); return slots[idx].term_id;
+            }
+            if (slots[idx].hash == crc && tokens_equal(slots[idx].text.data(), slots[idx].len, s, len)) {
                 return slots[idx].term_id;
+            }
             idx = (idx + 1) & mask;
         }
-        uint32_t id = num_terms++;
-        slots[idx].hash = crc; slots[idx].len = len; slots[idx].str = s; slots[idx].term_id = id;
-        term_strings.push_back(std::string_view(s, len));
-        return id;
     }
-
     inline uint32_t lookup(uint32_t crc, const char* s, uint32_t len) const {
         uint32_t idx = crc & mask;
-        while (slots[idx].str != nullptr) {
-            if (slots[idx].hash == crc && slots[idx].len == len && tokens_equal(slots[idx].str, s, len))
+        while (true) {
+            if (slots[idx].term_id == UINT32_MAX) return UINT32_MAX;
+            if (slots[idx].hash == crc && tokens_equal(slots[idx].text.data(), slots[idx].len, s, len)) {
                 return slots[idx].term_id;
+            }
             idx = (idx + 1) & mask;
         }
-        return UINT32_MAX;
     }
 };
 
@@ -140,15 +144,12 @@ inline uint32_t extract_doc_terms_fast(const char* dp, const char* text_end, con
                                        uint32_t doc_id, uint32_t* last_seen, uint32_t* doc_terms_buf) {
     uint32_t num_doc_terms = 0;
     while (dp < text_end) {
-        uint8_t c = CHAR_MAP[(unsigned char)*dp++];
-        if (!c) continue;
+        uint8_t c = CHAR_MAP[(unsigned char)*dp++]; if (!c) continue;
         const char* tok_start = dp - 1;
         uint32_t crc = _mm_crc32_u8(0, c);
         while (dp < text_end) {
-            c = CHAR_MAP[(unsigned char)*dp];
-            if (!c) break;
-            crc = _mm_crc32_u8(crc, c);
-            dp++;
+            c = CHAR_MAP[(unsigned char)*dp]; if (!c) break;
+            crc = _mm_crc32_u8(crc, c); dp++;
         }
         uint32_t tok_len = (uint32_t)(dp - tok_start);
         uint32_t b1 = crc & 0xFFFFF;
@@ -195,35 +196,6 @@ struct ThreadAccumulator {
     bool is_dense = false, is_empty = false;
     std::vector<uint32_t> ids, temp_ids;
     std::vector<uint64_t> bitset;
-};
-
-struct MatchBlock {
-    static constexpr size_t CAP = 16384;
-    size_t len = 0;
-    uint32_t data[CAP];
-    MatchBlock* next = nullptr;
-};
-
-struct MatchWriter {
-    MatchBlock* head = nullptr;
-    MatchBlock* cur = nullptr;
-
-    void init() { head = cur = new MatchBlock(); }
-    inline void push_doc(uint32_t doc_id, uint32_t count, const uint32_t* term_ids) {
-        if (cur->len + 2 + count > MatchBlock::CAP) {
-            MatchBlock* nb = new MatchBlock();
-            cur->next = nb; cur = nb;
-        }
-        cur->data[cur->len++] = doc_id;
-        cur->data[cur->len++] = count;
-        memcpy(&cur->data[cur->len], term_ids, count * sizeof(uint32_t));
-        cur->len += count;
-    }
-    void clear() {
-        MatchBlock* b = head;
-        while (b) { MatchBlock* next = b->next; delete b; b = next; }
-        head = cur = nullptr;
-    }
 };
 
 int main(int argc, char** argv) {
@@ -294,7 +266,7 @@ int main(int argc, char** argv) {
                 if (cur < p_term_end && *cur == ' ') cur++;
                 uint32_t tid = register_term(tok);
                 q.p.term_ids[q.p.num_terms] = tid;
-                q.p.terms[q.p.num_terms++] = term_table.term_strings[tid];
+                q.p.terms[q.p.num_terms++] = tok;
             }
             queries.push_back(q);
         }
@@ -307,40 +279,36 @@ int main(int argc, char** argv) {
     if (!docs_file.open(docs_path)) return 1;
 
     uint32_t N = 0;
-    if (docs_file.size > 0) {
-        const char* end_ptr = docs_file.data + docs_file.size;
-        while (end_ptr > docs_file.data && (*(end_ptr - 1) == '\n' || *(end_ptr - 1) == '\r')) end_ptr--;
-        const char* last_line = end_ptr;
-        while (last_line > docs_file.data && *(last_line - 1) != '\n') last_line--;
-        uint32_t max_id = 0;
-        const char* p_id = last_line;
-        while (p_id < end_ptr && *p_id >= '0' && *p_id <= '9') max_id = max_id * 10 + (*p_id++ - '0');
-        N = max_id + 1;
+    {
+        const char* p = docs_file.data + docs_file.size - 1;
+        while (p > docs_file.data && *p == '\n') p--;
+        while (p > docs_file.data && *p != '\n') p--;
+        if (*p == '\n') p++;
+        while (p < docs_file.data + docs_file.size && *p >= '0' && *p <= '9') {
+            N = N * 10 + (uint32_t)(*p++ - '0');
+        }
+        N += 1;
     }
 
-    std::vector<uint32_t> doc_offsets(N);
     size_t num_words = (N + 63) / 64;
+    std::vector<uint32_t> doc_offsets(N, 0);
 
     unsigned int hw_threads = std::thread::hardware_concurrency();
     if (hw_threads == 0) hw_threads = 8;
-    unsigned int num_threads = std::min(hw_threads, 16u);
+    unsigned int num_threads = std::min(hw_threads, 12u);
 
     uint32_t DF_THRESHOLD = std::max(256u, (uint32_t)(N / 32));
 
     std::vector<TermInfo> terms(num_query_terms);
+    std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(num_query_terms, 0));
+    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_query_terms, 0));
+
     uint64_t* dense_bitsets = nullptr;
     uint32_t* sparse_postings = nullptr;
     uint32_t num_dense_terms = 0, total_sparse_postings = 0;
 
-    std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(num_query_terms, 0));
-    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_query_terms, 0));
-    std::vector<MatchWriter> thread_writers(num_threads);
-
     size_t chunk_bytes = docs_file.size / num_threads;
-    size_t num_queries = queries.size();
-    size_t q_step = (num_queries + num_threads - 1) / num_threads;
     std::vector<std::string> thread_outputs(num_threads);
-
     std::barrier sync_point(num_threads);
 
     std::vector<std::thread> workers;
@@ -355,21 +323,20 @@ int main(int argc, char** argv) {
                 p = find_char_avx2(p, file_end, '\n');
                 if (p < file_end && *p == '\n') p++;
             }
+            const char* my_start = p;
 
             uint32_t* my_df = thread_df[tid].data();
             uint32_t doc_terms_buf[1024];
             std::vector<uint32_t> last_seen(num_query_terms, 0xFFFFFFFF);
-            MatchWriter& writer = thread_writers[tid];
-            writer.init();
 
-            const char* last_evicted = p;
-
+            // ==========================================
+            // PASS 1: Count DF and record doc_offsets (ZERO dynamic match buffer!)
+            // ==========================================
             while (p < docs_file.data + b_end && p < file_end) {
                 const char* tab_pos = find_char_avx2(p, file_end, '\t');
                 if (tab_pos >= file_end) break;
-
                 uint32_t doc_id = 0;
-                for (const char* dptr = p; dptr < tab_pos; ++dptr) doc_id = doc_id * 10 + (*dptr - '0');
+                for (const char* cp = p; cp < tab_pos; ++cp) doc_id = doc_id * 10 + (uint32_t)(*cp - '0');
 
                 const char* text_start = tab_pos + 1;
                 const char* text_end = find_char_avx2(text_start, file_end, '\n');
@@ -377,29 +344,15 @@ int main(int argc, char** argv) {
                 if (doc_id < N) doc_offsets[doc_id] = (uint32_t)(text_start - docs_file.data);
 
                 uint32_t unique_count = extract_doc_terms_fast(text_start, text_end, term_table, doc_id, last_seen.data(), doc_terms_buf);
-                if (unique_count > 0) {
-                    for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
-                    writer.push_doc(doc_id, unique_count, doc_terms_buf);
-                }
-                p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
+                for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
 
-                if ((size_t)(p - last_evicted) >= 524288) {
-                    uintptr_t s = (uintptr_t)last_evicted & ~4095ULL;
-                    uintptr_t e = (uintptr_t)p & ~4095ULL;
-                    if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
-                    last_evicted = p;
-                }
-            }
-            if (p > last_evicted) {
-                uintptr_t s = (uintptr_t)last_evicted & ~4095ULL;
-                uintptr_t e = (uintptr_t)p & ~4095ULL;
-                if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
             }
 
             sync_point.arrive_and_wait();
 
+            // Thread 0 allocates dense & sparse pools
             if (tid == 0) {
-                madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
                 uint32_t cur_sparse_offset = 0;
                 for (uint32_t t = 0; t < num_query_terms; ++t) {
                     uint32_t tot = 0;
@@ -428,44 +381,51 @@ int main(int argc, char** argv) {
 
             sync_point.arrive_and_wait();
 
+            // ==========================================
+            // PASS 2: Stream through docs.txt directly into sparse_postings & dense_bitsets
+            // Boiling hot in CPU cache, ZERO dynamic allocations!
+            // ==========================================
             uint32_t* my_write_offsets = thread_write_offsets[tid].data();
-            MatchBlock* b = writer.head;
+            p = my_start;
+            std::fill(last_seen.begin(), last_seen.end(), 0xFFFFFFFF);
 
-            while (b) {
-                size_t cur_pos = 0;
-                while (cur_pos < b->len) {
-                    uint32_t doc_id = b->data[cur_pos++];
-                    uint32_t count = b->data[cur_pos++];
-                    size_t word_idx = doc_id >> 6;
-                    uint64_t bit_mask = 1ULL << (doc_id & 63);
+            while (p < docs_file.data + b_end && p < file_end) {
+                const char* tab_pos = find_char_avx2(p, file_end, '\t');
+                if (tab_pos >= file_end) break;
+                uint32_t doc_id = 0;
+                for (const char* cp = p; cp < tab_pos; ++cp) doc_id = doc_id * 10 + (uint32_t)(*cp - '0');
 
-                    for (uint32_t j = 0; j < count; ++j) {
-                        uint32_t term_id = b->data[cur_pos++];
-                        const TermInfo& ti = terms[term_id];
-                        if (ti.dense_idx != UINT32_MAX) {
-                            __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
-                        } else {
-                            sparse_postings[my_write_offsets[term_id]++] = doc_id;
-                        }
+                const char* text_start = tab_pos + 1;
+                const char* text_end = find_char_avx2(text_start, file_end, '\n');
+
+                uint32_t unique_count = extract_doc_terms_fast(text_start, text_end, term_table, doc_id, last_seen.data(), doc_terms_buf);
+                for (uint32_t j = 0; j < unique_count; ++j) {
+                    uint32_t tid_term = doc_terms_buf[j];
+                    const TermInfo& ti = terms[tid_term];
+                    if (ti.dense_idx != UINT32_MAX) {
+                        __atomic_fetch_or((unsigned long long*)&dense_bitsets[(size_t)ti.dense_idx * num_words + (doc_id >> 6)], (1ULL << (doc_id & 63)), __ATOMIC_RELAXED);
+                    } else {
+                        sparse_postings[my_write_offsets[tid_term]++] = doc_id;
                     }
                 }
-                b = b->next;
+                p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
             }
-            writer.clear();
 
             sync_point.arrive_and_wait();
             if (tid == 0) std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
             sync_point.arrive_and_wait();
 
+            // ==========================================
+            // STAGE 3: Answer queries
+            // ==========================================
+            size_t num_queries = queries.size();
+            size_t q_step = (num_queries + num_threads - 1) / num_threads;
             size_t q_start = tid * q_step, q_end = std::min(num_queries, (tid + 1) * q_step);
             std::string& out = thread_outputs[tid];
             out.reserve((q_end > q_start ? (q_end - q_start) : 1) * 32);
 
             ThreadAccumulator R;
-            R.ids.reserve(DF_THRESHOLD * 2 + 64);
-            R.temp_ids.reserve(DF_THRESHOLD * 2 + 64);
-            R.bitset.resize(num_words > 0 ? num_words : 1);
-
+            R.bitset.resize(num_words);
             std::vector<uint32_t> candidates, matches;
             candidates.reserve(128); matches.reserve(128);
             TokenRef window[8];
@@ -579,10 +539,11 @@ int main(int argc, char** argv) {
                         for (size_t w = 0; w < num_words; ++w) {
                             uint64_t val = R.bitset[w]; if (!val) continue;
                             uint64_t base_id = w * 64;
-                            if (found < 10) {
+                            if (__builtin_expect(found < 10, 0)) {
                                 uint64_t temp = val;
                                 while (temp) {
-                                    uint32_t doc_id = (uint32_t)(base_id + std::countr_zero(temp));
+                                    int bit = std::countr_zero(temp);
+                                    uint32_t doc_id = (uint32_t)(base_id + bit);
                                     sum += doc_id;
                                     if (found < 10) first10[found++] = doc_id;
                                     temp &= temp - 1;
@@ -661,12 +622,14 @@ int main(int argc, char** argv) {
                             tok_count++;
 
                             if (tok_count >= k) {
-                                bool ok = true; uint32_t start_idx = tok_count - k;
-                                for (uint32_t j = 0; j < k; ++j) {
-                                    const TokenRef& tok = window[(start_idx + j) % k];
-                                    if (!phrase_tokens_match(q.p.terms[j], tok)) { ok = false; break; }
+                                bool all_match = true;
+                                for (uint8_t m = 0; m < k; ++m) {
+                                    uint32_t win_idx = (tok_count - k + m) % k;
+                                    if (!phrase_tokens_match(q.p.terms[m], window[win_idx])) {
+                                        all_match = false; break;
+                                    }
                                 }
-                                if (ok) { matched = true; break; }
+                                if (all_match) { matched = true; break; }
                             }
                         }
                         if (matched) { matches.push_back(doc_id); sum += doc_id; }
@@ -688,8 +651,5 @@ int main(int argc, char** argv) {
     }
     fclose(fp);
 
-    if (dense_bitsets) free(dense_bitsets);
-    if (sparse_postings) free(sparse_postings);
-
-    return 0;
+    _exit(0);
 }
