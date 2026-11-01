@@ -59,11 +59,11 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-// 2 MB SIMD 4-slot hash table (262,144 slots -> 42.5% load factor at full scale)
-static constexpr u32 BITS = 18, SLOTS = 1 << BITS;
+// 1 MB SIMD 4-slot hash table (131,072 slots -> 1 MB, stays 100% in L2 cache!)
+static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
 alignas(64) static std::atomic<u64> g_slots[SLOTS];
 
-// Country bitsets: 256 countries * 4096 words (8 MB total, charged only once touched)
+// Country bitsets: 256 countries * 2048 words (4 MB total)
 static constexpr u32 WORDS_PER_COUNTRY = SLOTS / 64;
 alignas(64) static std::atomic<u64> g_seen_bits[256 * WORDS_PER_COUNTRY];
 
@@ -166,7 +166,7 @@ int main(int argc, char* argv[]) {
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf_records.size < 200000) nthreads = 1;
 
-    // Dynamic work-stealing with 64 pieces to eliminate tail latency
+    // 64 pieces for dynamic work stealing
     const unsigned int num_pieces = (nthreads == 1) ? 1 : 64;
     std::vector<Chunk> chunks(num_pieces);
     chunks[0].start = ptr0;
@@ -202,11 +202,38 @@ int main(int argc, char* argv[]) {
         auto& my_countries = tdata[t].countries;
         __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
 
+        // 16-record ring buffer to overlap memory latency
+        constexpr size_t LAG = 16;
+        struct PendingRec {
+            uint64_t name_hash;
+            uint64_t id;
+            int64_t cents;
+            size_t name_len;
+            size_t note_len;
+            uint32_t region_id;
+        } ring[LAG];
+
+        auto process_pending = [&](const PendingRec& rec) {
+            uint8_t cid = (rec.region_id < 1000000) ? region_to_country[rec.region_id] : 0;
+            LocalCountryAgg& agg = my_countries[cid];
+            if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = rec.cents; }
+            else { agg.amount_min = std::min(agg.amount_min, rec.cents); agg.amount_max = std::max(agg.amount_max, rec.cents); }
+            agg.count++; agg.id_sum += rec.id; agg.amount_sum += rec.cents;
+            agg.name_bytes += rec.name_len; agg.note_bytes += rec.note_len;
+
+            uint64_t nh = rec.name_hash ? rec.name_hash : 1;
+            u32 name_id = get_name_id(nh);
+            if (mark_seen(cid, name_id)) {
+                agg.distinct_names++;
+            }
+        };
+
         for (;;) {
             unsigned int p_idx = piece_idx.fetch_add(1, std::memory_order_relaxed);
             if (p_idx >= num_pieces) break;
 
             const char* ptr = chunks[p_idx].start, *chunk_end = chunks[p_idx].end;
+            size_t ring_count = 0;
 
             while (ptr < chunk_end) {
                 _mm_prefetch(ptr + 2048, _MM_HINT_T0);
@@ -309,19 +336,28 @@ int main(int argc, char* argv[]) {
                 if (neg) cents = -cents;
                 if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
 
-                uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
-                LocalCountryAgg& agg = my_countries[cid];
-                if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
-                else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
-                agg.count++; agg.id_sum += id; agg.amount_sum += cents;
-                agg.name_bytes += name_len; agg.note_bytes += note_len;
-
+                // Prefetch table slots
                 uint64_t nh = name_hash ? name_hash : 1;
-                u32 name_id = get_name_id(nh);
-                if (mark_seen(cid, name_id)) {
-                    agg.distinct_names++;
+                u32 probe_idx = (u32)((nh ^ (nh >> 16)) & (SLOTS - 1)) & ~3u;
+                _mm_prefetch(reinterpret_cast<const char*>(&g_slots[probe_idx]), _MM_HINT_T0);
+                if (region_id < 1000000) {
+                    _mm_prefetch(reinterpret_cast<const char*>(&region_to_country[region_id]), _MM_HINT_T0);
                 }
+
+                size_t ring_slot = ring_count % LAG;
+                if (ring_count >= LAG) {
+                    process_pending(ring[ring_slot]);
+                }
+                ring[ring_slot] = {name_hash, id, cents, name_len, note_len, region_id};
+                ring_count++;
             }
+
+            // Drain remaining in ring
+            size_t start_drain = (ring_count >= LAG) ? ring_count - LAG : 0;
+            for (size_t i = start_drain; i < ring_count; ++i) {
+                process_pending(ring[i % LAG]);
+            }
+
             uintptr_t p_from = reinterpret_cast<uintptr_t>(chunks[p_idx].start) & ~uintptr_t(4095);
             uintptr_t p_to = reinterpret_cast<uintptr_t>(chunks[p_idx].end) & ~uintptr_t(4095);
             if (p_to > p_from) madvise(reinterpret_cast<void*>(p_from), p_to - p_from, MADV_DONTNEED);
