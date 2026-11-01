@@ -185,6 +185,7 @@ struct Chunk {
 struct Parser {
   Chunk *last[HOURS] = {}, *next = nullptr, *kept = nullptr;
   std::vector<std::pair<u32, u32>> wide[HOURS];
+  u32 total[HOURS] = {};
 
   void map(size_t size) {
     size_t bytes = (size / 40 / Chunk::CAP + 1 + HOURS) * sizeof(Chunk);
@@ -194,6 +195,7 @@ struct Parser {
 
   void run(const char *p, const char *end) {
     while (p < end) {
+      _mm_prefetch(p + 2048, _MM_HINT_T0);
       int day = (p[8] - '0') * 10 + p[9] - '0',
           hr = (p[11] - '0') * 10 + p[12] - '0',
           h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18;
@@ -207,6 +209,7 @@ struct Parser {
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
       u32 lat = decode(eol, eol - ne - 5);
       p = eol + 1;
+      total[h]++;
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
         wide[h].push_back({lat, key});
         continue;
@@ -294,7 +297,7 @@ int main(int argc, char** argv) {
     for (int h = 0; h < HOURS; ++h) {
       u32 n = 0;
       for (auto &ps : parsers)
-        ps.each(h, rank.data(), [&](u32, u32, u32) { ++n; });
+        n += ps.total[h];
       most = std::max(most, n);
     }
     std::vector<std::pair<std::string_view, u32>> by_name;

@@ -155,6 +155,12 @@ int main(int argc, char* argv[]) {
     }
     mf_regions.close();
 
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+    madvise((void*)g_slots, sizeof(g_slots), MADV_POPULATE_WRITE);
+    madvise((void*)g_seen_bits, sizeof(g_seen_bits), MADV_POPULATE_WRITE);
+
     MappedFile mf_records;
     if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
     madvise((void*)mf_records.data, mf_records.size, MADV_WILLNEED | MADV_SEQUENTIAL);
@@ -342,9 +348,6 @@ int main(int argc, char* argv[]) {
                 _mm_prefetch(reinterpret_cast<const char*>(&g_slots[probe_idx]), _MM_HINT_T0);
                 if (region_id < 1000000) {
                     _mm_prefetch(reinterpret_cast<const char*>(&region_to_country[region_id]), _MM_HINT_T0);
-                    uint8_t pre_cid = region_to_country[region_id];
-                    size_t seen_idx = (size_t)pre_cid * WORDS_PER_COUNTRY + (probe_idx >> 6);
-                    __builtin_prefetch(&g_seen_bits[seen_idx], 1);
                 }
 
                 size_t ring_slot = ring_count % LAG;
