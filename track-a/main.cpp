@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <immintrin.h>
+#include <atomic>
+#include <memory>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -26,6 +29,7 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) *--b = (char)('0' + val); else { b -= 2; memcpy(b, &DIGITS_LUT[val * 2], 2); }
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
 }
+
 inline void append_line(std::string& out, const std::string& h, const std::string& ep,
                         uint32_t count, uint32_t p50, uint32_t p95, uint32_t p99, uint32_t errs, uint32_t ppm) {
     char buf[512], *p = buf;
@@ -35,10 +39,11 @@ inline void append_line(std::string& out, const std::string& h, const std::strin
     p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n';
     out.append(buf, p - buf);
 }
+
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
-    int fd = -1; HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
+    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
     bool open(const std::string& path) {
         hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
@@ -102,10 +107,12 @@ struct EndpointTable {
     }
 };
 
+struct ReqItem { uint16_t ep_id; uint16_t hid; uint32_t lat; };
+
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
-    std::vector<uint64_t> local_reqs;
+    std::vector<ReqItem> local_reqs;
     std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
     std::string out_buffer;
@@ -142,8 +149,10 @@ int main(int argc, char* argv[]) {
     }
     std::vector<ThreadData> tdata(nthreads);
     std::vector<std::string> global_endpoints; size_t N = 0, G = 0;
-    std::vector<uint32_t> global_counts, global_errors, all_latencies, write_offsets;
-    std::vector<size_t> group_offsets; std::barrier sync_point(nthreads);
+    std::vector<uint32_t> global_counts, global_errors, all_latencies;
+    std::vector<size_t> group_offsets;
+    std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
+    std::barrier sync_point(nthreads);
 
     auto worker_fn = [&](unsigned int t) {
         auto& td = tdata[t];
@@ -171,7 +180,7 @@ int main(int argc, char* argv[]) {
             cur += 5;
             uint32_t lat = (uint8_t)(*cur++ - '0');
             while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
-            td.local_reqs.push_back(((uint64_t)ep_id << 48) | ((uint64_t)hid << 32) | (uint64_t)lat);
+            td.local_reqs.push_back({ep_id, (uint16_t)hid, lat});
             while (cur < end && (*cur == '\r' || *cur == '\n')) ++cur;
             p = cur;
         }
@@ -193,7 +202,7 @@ int main(int argc, char* argv[]) {
                     tdata[ot].ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), tdata[ot].local_endpoints[i]) - global_endpoints.begin());
             }
             if (N > 0) {
-                global_counts.assign(G, 0); global_errors.assign(G, 0); write_offsets.assign(nthreads * G, 0);
+                global_counts.assign(G, 0); global_errors.assign(G, 0);
                 for (unsigned int ot = 0; ot < nthreads; ++ot) {
                     size_t lep_count = tdata[ot].local_endpoints.size();
                     for (size_t h = 0; h < H; ++h) {
@@ -203,7 +212,6 @@ int main(int argc, char* argv[]) {
                             if (c) {
                                 size_t ggid = b_dst + tdata[ot].ep_remap[lep];
                                 global_counts[ggid] += c; global_errors[ggid] += tdata[ot].errors[b_src + lep];
-                                write_offsets[ot * G + ggid] = c;
                             }
                         }
                     }
@@ -211,16 +219,11 @@ int main(int argc, char* argv[]) {
                     tdata[ot].errors.clear(); tdata[ot].errors.shrink_to_fit();
                     tdata[ot].local_endpoints.clear(); tdata[ot].local_endpoints.shrink_to_fit();
                 }
-                group_offsets.resize(G + 1, 0); uint32_t running_pos = 0;
-                for (size_t g = 0; g < G; ++g) {
-                    group_offsets[g] = running_pos;
-                    for (unsigned int ot = 0; ot < nthreads; ++ot) {
-                        uint32_t c = write_offsets[ot * G + g];
-                        write_offsets[ot * G + g] = running_pos;
-                        running_pos += c;
-                    }
-                }
-                group_offsets[G] = running_pos; all_latencies.resize(running_pos);
+                group_offsets.resize(G + 1, 0);
+                for (size_t g = 0; g < G; ++g) group_offsets[g + 1] = group_offsets[g] + global_counts[g];
+                all_latencies.resize(group_offsets[G]);
+                atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
+                for (size_t g = 0; g < G; ++g) atomic_write_offsets[g].store((uint32_t)group_offsets[g], std::memory_order_relaxed);
             }
             mf.close();
         }
@@ -228,18 +231,15 @@ int main(int argc, char* argv[]) {
 
         if (N == 0) return;
         const auto& remap = td.ep_remap;
-        for (uint64_t req : td.local_reqs) {
-            uint32_t lat = (uint32_t)req;
-            uint16_t hid = (uint16_t)((req >> 32) & 0xFFFF);
-            uint16_t lep = (uint16_t)(req >> 48);
-            uint32_t ggid = (uint32_t)hid * N + remap[lep];
-            uint32_t pos = write_offsets[t * G + ggid]++;
-            all_latencies[pos] = lat;
+        for (const auto& req : td.local_reqs) {
+            uint32_t ggid = (uint32_t)req.hid * N + remap[req.ep_id];
+            uint32_t pos = atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed);
+            all_latencies[pos] = req.lat;
         }
         td.local_reqs.clear(); td.local_reqs.shrink_to_fit(); td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
         sync_point.arrive_and_wait();
 
-        if (t == 0) { write_offsets.clear(); write_offsets.shrink_to_fit(); }
+        if (t == 0) atomic_write_offsets.reset();
         auto& out = td.out_buffer; out.reserve(512 * 1024);
         size_t total_lines = group_offsets[G];
         size_t t_s = (total_lines * t) / nthreads, t_e = (total_lines * (t + 1)) / nthreads;
