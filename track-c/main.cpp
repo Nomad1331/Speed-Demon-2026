@@ -17,6 +17,9 @@
 #define O_BINARY 0
 #endif
 
+using u32 = uint32_t;
+using u64 = uint64_t;
+
 static const char DIGITS_LUT[] =
     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
@@ -56,13 +59,40 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-struct alignas(8) NameSlot {
-    std::atomic<uint64_t> hash{0};
-    std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
-};
+// Ultra-compact 1 MB SIMD 4-slot hash table
+static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
+alignas(64) static std::atomic<u64> g_slots[SLOTS];
 
-static constexpr size_t HASH_CAP = 1 << 17;
-static constexpr size_t HASH_MASK = HASH_CAP - 1;
+// Country bitsets: 256 countries * 2048 words (4 MB total)
+static constexpr u32 WORDS_PER_COUNTRY = SLOTS / 64;
+alignas(64) static std::atomic<u64> g_seen_bits[256 * WORDS_PER_COUNTRY];
+
+inline u32 get_name_id(u64 k) {
+    for (u32 i = (u32)((k ^ (k >> 16)) & (SLOTS - 1)) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
+        __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i*>(&g_slots[i]));
+        u32 hit = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_set1_epi64x(k))));
+        if (hit) return i + __builtin_ctz(hit);
+        u32 free = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())));
+        while (free) {
+            u32 j = i + __builtin_ctz(free);
+            u64 expected = 0;
+            if (g_slots[j].compare_exchange_strong(expected, k, std::memory_order_relaxed) || expected == k) {
+                return j;
+            }
+            free &= free - 1;
+        }
+    }
+}
+
+inline bool mark_seen(u32 cid, u32 name_id) {
+    size_t idx = (size_t)cid * WORDS_PER_COUNTRY + (name_id >> 6);
+    u64 bit = 1ULL << (name_id & 63);
+    u64 cur = g_seen_bits[idx].load(std::memory_order_relaxed);
+    if (!(cur & bit)) {
+        return !(g_seen_bits[idx].fetch_or(bit, std::memory_order_relaxed) & bit);
+    }
+    return false;
+}
 
 struct LocalCountryAgg {
     uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
@@ -124,9 +154,6 @@ int main(int argc, char* argv[]) {
         if (p < rend && *p == '\n') p++;
     }
     mf_regions.close();
-
-    NameSlot* name_table = (NameSlot*)::mmap(NULL, sizeof(NameSlot) * HASH_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (name_table == MAP_FAILED) return 1;
 
     MappedFile mf_records;
     if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
@@ -278,27 +305,9 @@ int main(int argc, char* argv[]) {
             agg.name_bytes += name_len; agg.note_bytes += note_len;
 
             uint64_t nh = name_hash ? name_hash : 1;
-            size_t idx = (nh ^ (nh >> 16)) & HASH_MASK;
-            NameSlot* entry = nullptr;
-            while (true) {
-                uint64_t cur = name_table[idx].hash.load(std::memory_order_relaxed);
-                if (cur == nh) { entry = &name_table[idx]; break; }
-                if (cur == 0) {
-                    uint64_t expected = 0;
-                    if (name_table[idx].hash.compare_exchange_strong(expected, nh, std::memory_order_relaxed)) {
-                        entry = &name_table[idx]; break;
-                    }
-                    if (expected == nh) { entry = &name_table[idx]; break; }
-                }
-                idx = (idx + 1) & HASH_MASK;
-            }
-            uint32_t w = cid >> 6;
-            uint64_t bit = 1ULL << (cid & 63);
-            uint64_t cur_seen = entry->seen[w].load(std::memory_order_relaxed);
-            if (!(cur_seen & bit)) {
-                if (!(entry->seen[w].fetch_or(bit, std::memory_order_relaxed) & bit)) {
-                    agg.distinct_names++;
-                }
+            u32 name_id = get_name_id(nh);
+            if (mark_seen(cid, name_id)) {
+                agg.distinct_names++;
             }
         }
     };
