@@ -1,4 +1,3 @@
-#include <iostream>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -38,7 +37,8 @@ inline void append_line(std::string& out, const std::string& h, const std::strin
     memcpy(p, h.data(), h.size()); p += h.size(); *p++ = ' '; memcpy(p, ep.data(), ep.size()); p += ep.size(); *p++ = ' ';
     p = write_u32_fast(p, count); *p++ = ' '; p = write_u32_fast(p, p50); *p++ = ' ';
     p = write_u32_fast(p, p95); *p++ = ' '; p = write_u32_fast(p, p99); *p++ = ' ';
-    p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n'; out.append(buf, p - buf);
+    p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n';
+    out.append(buf, p - buf);
 }
 
 struct MappedFile {
@@ -48,7 +48,8 @@ struct MappedFile {
     bool open(const std::string& path) {
         hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER fs; if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
+        LARGE_INTEGER fs;
+        if (!GetFileSizeEx(hFile, &fs) || (size = (size_t)fs.QuadPart) == 0) { CloseHandle(hFile); return false; }
         hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
         return hMap && (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
     }
@@ -64,38 +65,42 @@ struct MappedFile {
 #endif
 };
 
-inline uint32_t hash_endpoint(const char* s, size_t len) {
-    uint64_t h = 0xcbf29ce484222325ULL ^ len;
-    while (len >= 8) { uint64_t v; memcpy(&v, s, 8); h = (h ^ v) * 0x100000001b3ULL; s += 8; len -= 8; }
-    if (len >= 4) { uint32_t v; memcpy(&v, s, 4); h = (h ^ v) * 0x100000001b3ULL; s += 4; len -= 4; }
-    while (len > 0) { h = (h ^ (uint8_t)*s) * 0x100000001b3ULL; ++s; --len; }
-    uint32_t res = (uint32_t)(h ^ (h >> 32)); return res ? res : 1;
+inline void drop_pages(const char* ptr, size_t len) {
+#ifndef _WIN32
+    if (!ptr || len == 0) return;
+    uintptr_t s = (uintptr_t)ptr & ~4095ULL, e = ((uintptr_t)ptr + len + 4095ULL) & ~4095ULL;
+    madvise((void*)s, e - s, MADV_DONTNEED);
+#endif
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct EpEntry { uint32_t hash = 0; uint16_t local_id = 0; };
+struct EpEntry { uint64_t hash = 0; uint16_t len = 0, local_id = 0, global_id = 0; };
 struct EndpointTable {
-    static constexpr size_t CAP = 4096, MASK = CAP - 1;
+    static constexpr size_t CAP = 8192, MASK = CAP - 1;
     EpEntry entries[CAP];
     EndpointTable() { memset(entries, 0, sizeof(entries)); }
-    inline uint16_t lookup_or_insert(const char* s, size_t len, uint32_t h, std::vector<std::string>& eps) {
+    inline uint16_t lookup_or_insert(const char* s, uint16_t len, uint64_t h, std::vector<std::string>& eps) {
         size_t idx = h & MASK;
         while (entries[idx].hash != 0) {
-            if (entries[idx].hash == h && eps[entries[idx].local_id].size() == len && !memcmp(eps[entries[idx].local_id].data(), s, len))
+            if (entries[idx].hash == h && entries[idx].len == len && !memcmp(eps[entries[idx].local_id].data(), s, len))
                 return entries[idx].local_id;
             idx = (idx + 1) & MASK;
         }
-        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, lid}; return lid;
+        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, len, lid, 0}; return lid;
+    }
+    inline uint16_t lookup(uint16_t len, uint64_t h) const {
+        size_t idx = h & MASK;
+        while (true) {
+            if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].global_id;
+            idx = (idx + 1) & MASK;
+        }
     }
 };
-
 struct ActiveGroup { uint8_t hid; uint16_t lep; };
-struct Record { uint32_t latency; uint16_t lep; uint8_t hid; };
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
     std::vector<ActiveGroup> active_groups;
-    std::vector<Record> records;
     std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
     std::string out_buffer;
@@ -110,7 +115,6 @@ inline int get_hour_id(const char* p) {
 }
 
 int main(int argc, char* argv[]) {
-    std::ios_base::sync_with_stdio(false);
     std::string data_dir = "/data", out_dir = "/out";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) data_dir = argv[++i];
@@ -160,35 +164,23 @@ int main(int argc, char* argv[]) {
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         char last_hour[13] = {0}; int last_hid = -1;
 
-        // Pass 1: Parse endpoints, hours, counts, errors, and latencies in one single file scan
-        td.records.reserve((chunks[t].end - chunks[t].start) / 45);
+        // Pass 1: Parse endpoints, hours, counts, and errors (hash computed while scanning)
         while (p < end) {
             if (p + 27 > end) break;
             int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
             if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
-            const char* cur = p + 28;
-            switch (cur[0]) {
-                case 'G': cur += 4; break;
-                case 'P':
-                    if (cur[1] == 'O') cur += 5;
-                    else if (cur[1] == 'U') cur += 4;
-                    else cur += 6;
-                    break;
-                case 'D': cur += 7; break;
-                case 'H': cur += 5; break;
-                default: cur += 8; break;
-            }
-            const char* ep_start = cur; while (*cur != ' ') ++cur;
-            size_t ep_len = cur - ep_start;
-            uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, hash_endpoint(ep_start, ep_len), td.local_endpoints);
+            const char* cur = p + 28; while (*cur != ' ') ++cur;
+            const char* ep_start = ++cur;
+            uint64_t ep_hash = 14695981039346656037ULL;
+            while (*cur != ' ') { ep_hash = (ep_hash ^ (uint8_t)*cur) * 1099511628211ULL; ++cur; }
+            uint16_t ep_len = (uint16_t)(cur - ep_start);
+            uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
             const char* st = ++cur; size_t idx = (size_t)hid * MAX_EP + ep_id;
             if (td.counts[idx]++ == 0) td.active_groups.push_back({(uint8_t)hid, ep_id});
             if (st[0] == '5') td.errors[idx]++;
-            cur = st + 4; uint32_t lat = 0;
-            while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
-            td.records.push_back({lat, ep_id, (uint8_t)hid});
-            if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
+            cur = st + 4; while (*cur != '\n') ++cur; p = cur + 1;
         }
+        drop_pages(mf.data + chunks[t].start, chunks[t].end - chunks[t].start);
         sync_point.arrive_and_wait();
 
         if (t == 0) {
@@ -205,11 +197,10 @@ int main(int argc, char* argv[]) {
         sync_point.arrive_and_wait();
         if (N == 0) return;
 
-        size_t lep_count = td.local_endpoints.size();
-        td.ep_remap.resize(lep_count);
-        for (size_t i = 0; i < lep_count; ++i) {
+        td.ep_remap.resize(td.local_endpoints.size());
+        for (size_t i = 0; i < td.local_endpoints.size(); ++i)
             td.ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), td.local_endpoints[i]) - global_endpoints.begin());
-        }
+        for (auto& entry : td.ep_table.entries) if (entry.hash) entry.global_id = td.ep_remap[entry.local_id];
         sync_point.arrive_and_wait();
 
         if (t == 0) {
@@ -240,43 +231,59 @@ int main(int argc, char* argv[]) {
         }
         sync_point.arrive_and_wait();
 
-        // Pass 2: In-memory scatter into all_latencies (zero file re-parsing)
+        // Pass 2: Stream latencies directly into flat all_latencies array
+        p = mf.data + chunks[t].start; last_hid = -1;
         uint32_t* wp = &write_offsets[t * G];
-        for (const auto& r : td.records) {
-            all_latencies[wp[(size_t)r.hid * N + td.ep_remap[r.lep]]++] = r.latency;
+        while (p < end) {
+            if (p + 27 > end) break;
+            int hid = (!memcmp(p, last_hour, 13)) ? last_hid : get_hour_id(p);
+            if (hid != last_hid) { memcpy(last_hour, p, 13); last_hid = hid; }
+            const char* cur = p + 28; while (*cur != ' ') ++cur;
+            const char* ep_start = ++cur;
+            uint64_t ep_hash = 14695981039346656037ULL;
+            while (*cur != ' ') { ep_hash = (ep_hash ^ (uint8_t)*cur) * 1099511628211ULL; ++cur; }
+            uint16_t ep_len = (uint16_t)(cur - ep_start);
+            uint16_t gep = td.ep_table.lookup(ep_len, ep_hash);
+            cur += 5; uint32_t lat = 0;
+            while (*cur >= '0' && *cur <= '9') { lat = lat * 10 + (*cur - '0'); ++cur; }
+            all_latencies[wp[(size_t)hid * N + gep]++] = lat;
+            if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
         }
-        td.records.clear(); td.records.shrink_to_fit();
+        drop_pages(mf.data + chunks[t].start, chunks[t].end - chunks[t].start);
         sync_point.arrive_and_wait();
 
-        // Pass 3: Parallel Percentiles & Output Formatting
+        if (t == 0) { write_offsets.clear(); write_offsets.shrink_to_fit(); }
+        sync_point.arrive_and_wait();
+
+        // Pass 3: Fully balanced percentiles and output formatting
         auto& out = td.out_buffer; out.reserve(512 * 1024);
-        size_t h_start = (H * t) / nthreads, h_end = (H * (t + 1)) / nthreads;
-        for (size_t h = h_start; h < h_end; ++h) {
-            const std::string& h_str = hour_strings[h];
-            for (size_t gep = 0; gep < N; ++gep) {
-                size_t g = h * N + gep, n = global_counts[g];
-                if (n == 0) continue;
-                uint32_t* begin = &all_latencies[group_offsets[g]], *end = begin + n, p50, p95, p99;
-                if (n == 1) { p50 = p95 = p99 = begin[0]; }
-                else if (n == 2) {
-                    if (begin[0] > begin[1]) std::swap(begin[0], begin[1]);
-                    p50 = begin[0]; p95 = p99 = begin[1];
-                } else {
-                    size_t r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-                    if (n <= 64) {
-                        std::sort(begin, end); p50 = begin[r50]; p95 = begin[r95]; p99 = begin[r99];
-                    } else {
-                        std::nth_element(begin, begin + r99, end); p99 = begin[r99];
-                        std::nth_element(begin, begin + r95, begin + r99); p95 = begin[r95];
-                        std::nth_element(begin, begin + r50, begin + r95); p50 = begin[r50];
-                    }
+        size_t total_lines = group_offsets[G];
+        size_t t_s = (total_lines * t) / nthreads, t_e = (total_lines * (t + 1)) / nthreads;
+        size_t g_s = std::lower_bound(group_offsets.begin(), group_offsets.end(), t_s) - group_offsets.begin();
+        size_t g_e = (t == nthreads - 1) ? G : (size_t)(std::lower_bound(group_offsets.begin(), group_offsets.end(), t_e) - group_offsets.begin());
+
+        for (size_t g = g_s; g < g_e; ++g) {
+            size_t n = global_counts[g];
+            if (n == 0) continue;
+            size_t h = g / N, gep = g % N;
+            uint32_t* begin = &all_latencies[group_offsets[g]], *end = begin + n, p50, p95, p99;
+            if (n == 1) { p50 = p95 = p99 = begin[0]; }
+            else if (n == 2) {
+                if (begin[0] > begin[1]) std::swap(begin[0], begin[1]);
+                p50 = begin[0]; p95 = p99 = begin[1];
+            } else {
+                size_t r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
+                if (n <= 64) { std::sort(begin, end); p50 = begin[r50]; p95 = begin[r95]; p99 = begin[r99]; }
+                else {
+                    std::nth_element(begin, begin + r99, end); p99 = begin[r99];
+                    std::nth_element(begin, begin + r95, begin + r99); p95 = begin[r95];
+                    std::nth_element(begin, begin + r50, begin + r95); p50 = begin[r50];
                 }
-                uint32_t errs = global_errors[g], ppm = ((uint64_t)errs * 1000000ULL) / n;
-                append_line(out, h_str, global_endpoints[gep], (uint32_t)n, p50, p95, p99, errs, (uint32_t)ppm);
             }
+            uint32_t errs = global_errors[g], ppm = ((uint64_t)errs * 1000000ULL) / n;
+            append_line(out, hour_strings[h], global_endpoints[gep], (uint32_t)n, p50, p95, p99, errs, (uint32_t)ppm);
         }
     };
-
     std::vector<std::thread> workers; workers.reserve(nthreads - 1);
     for (unsigned int t = 1; t < nthreads; ++t) workers.emplace_back(worker_fn, t);
     worker_fn(0);

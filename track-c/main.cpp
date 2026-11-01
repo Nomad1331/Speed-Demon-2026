@@ -1,4 +1,3 @@
-#include <iostream>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -7,7 +6,6 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -79,7 +77,6 @@ struct MappedFile {
 #endif
 };
 
-
 struct LocalCountryAgg {
     uint64_t count = 0; int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0;
     uint64_t name_bytes = 0, note_bytes = 0;
@@ -93,10 +90,8 @@ struct ThreadData {
 
 static uint8_t region_to_country[1000000];
 struct Chunk { const char* start = nullptr; const char* end = nullptr; };
-struct RegionRecord { uint32_t rid; uint16_t pack; };
 
 int main(int argc, char* argv[]) {
-    std::ios_base::sync_with_stdio(false);
     std::string data_dir = "/data", out_arg = "/out";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
@@ -113,13 +108,12 @@ int main(int argc, char* argv[]) {
     while (rptr < rend && *rptr != '\n') rptr++;
     if (rptr < rend && *rptr == '\n') rptr++;
 
-    std::vector<RegionRecord> reg_records; reg_records.reserve(200000);
     bool seen[26 * 26 * 26] = {false};
     std::vector<uint32_t> unique_codes; unique_codes.reserve(256);
 
     const char* p = rptr;
     while (p < rend) {
-        uint32_t rid = 0; while (p < rend && *p >= '0') rid = rid * 10 + (*p++ - '0');
+        while (p < rend && *p != ',') p++;
         if (p >= rend) break;
         p++;
         char c0 = p[0], c1 = p[1], c2 = p[2];
@@ -128,9 +122,8 @@ int main(int argc, char* argv[]) {
             seen[pack] = true;
             unique_codes.push_back(((uint32_t)c0 << 16) | ((uint32_t)c1 << 8) | (uint32_t)c2);
         }
-        reg_records.push_back({rid, pack});
         p += 3;
-        if (p < rend && *p == '\r') p++;
+        while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
     }
 
@@ -147,8 +140,17 @@ int main(int argc, char* argv[]) {
         country_names[cid] = std::string({c0, c1, c2});
         code_to_cid[(uint16_t)(((c0 - 'A') * 26 + (c1 - 'A')) * 26 + (c2 - 'A'))] = cid;
     }
-    for (const auto& reg : reg_records) {
-        if (reg.rid < 1000000) region_to_country[reg.rid] = code_to_cid[reg.pack];
+
+    p = rptr;
+    while (p < rend) {
+        uint32_t rid = 0; while (p < rend && *p >= '0') rid = rid * 10 + (*p++ - '0');
+        if (p >= rend) break;
+        p++;
+        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
+        if (rid < 1000000) region_to_country[rid] = code_to_cid[pack];
+        p += 3;
+        while (p < rend && *p != '\n') p++;
+        if (p < rend && *p == '\n') p++;
     }
 
     MappedFile mf_records;
@@ -202,10 +204,13 @@ int main(int argc, char* argv[]) {
                 ptr++;
                 while (true) {
                     char c = *ptr++;
-                    if (c == '"') {
+                    if (__builtin_expect(c != '"', 1)) {
+                        name_hash = (name_hash ^ (uint8_t)c) * 0x100000001b3ULL;
+                        name_len++;
+                    } else {
                         if (*ptr == '"') { ptr++; name_hash = (name_hash ^ '"') * 0x100000001b3ULL; name_len++; }
                         else break;
-                    } else { name_hash = (name_hash ^ (uint8_t)c) * 0x100000001b3ULL; name_len++; }
+                    }
                 }
                 ptr++;
             } else {
@@ -218,10 +223,12 @@ int main(int argc, char* argv[]) {
                 ptr++;
                 while (true) {
                     char c = *ptr++;
-                    if (c == '"') {
+                    if (__builtin_expect(c != '"', 1)) {
+                        note_len++;
+                    } else {
                         if (*ptr == '"') { ptr++; note_len++; }
                         else break;
-                    } else note_len++;
+                    }
                 }
                 ptr++;
             } else {
@@ -249,16 +256,24 @@ int main(int argc, char* argv[]) {
                 if (cents > agg.amount_max) agg.amount_max = cents;
             }
             agg.name_bytes += name_len; agg.note_bytes += note_len;
-
             my_names[cid].push_back(name_hash);
         }
 
-        for (int c = 0; c < 241; ++c) {
-            if (!my_names[c].empty()) {
-                std::sort(my_names[c].begin(), my_names[c].end());
-                my_names[c].erase(std::unique(my_names[c].begin(), my_names[c].end()), my_names[c].end());
+        // Deduplicate local names immediately per country
+        for (uint16_t c = 0; c <= num_countries; ++c) {
+            auto& v = my_names[c];
+            if (!v.empty()) {
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
             }
         }
+
+#ifndef _WIN32
+        uintptr_t s = (uintptr_t)chunks[t].start, e = (uintptr_t)chunks[t].end;
+        uintptr_t ps = 4096;
+        uintptr_t as = (s + ps - 1) & ~(ps - 1), ae = e & ~(ps - 1);
+        if (ae > as) madvise((void*)as, ae - as, MADV_DONTNEED);
+#endif
 
         sync_point.arrive_and_wait();
 
@@ -268,7 +283,7 @@ int main(int argc, char* argv[]) {
 
         char line_buf[256]; auto& out_buf = tdata[t].out_buf;
         out_buf.reserve((idx_end - idx_start) * 64);
-        std::vector<uint64_t> all_names; all_names.reserve(4096);
+        std::vector<uint64_t> all_names; all_names.reserve(2048);
 
         for (uint16_t idx = idx_start; idx < idx_end; ++idx) {
             uint8_t c = out_order[idx];

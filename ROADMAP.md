@@ -31,7 +31,8 @@
 - [x] **Iteration 2: SIMD Accumulator & LUT Tally:** AVX2 vector bitwise evaluation with 16-bit popcount & sum lookup table (`LUT16`) 🟢
 - [x] **Iteration 3: Anchor-Pruned Phrase Verification:** Bitset candidate intersection followed by on-the-fly exact token scan on candidate docs 🟢
 - [x] **Iteration 4: Packaging & Validation:** Multi-stage GCC 16 Dockerfile validated with `dockerfile_check.py` and zero-dependency `.speed-demon.toml` 🟢
-- [x] **Iteration 5: Verification:** Byte-identical SHA-256 match on `tiny` and `sample`, achieving 25.05 ms runtime (54.0x speedup, <36MB RAM) 🟢
+- [x] **Iteration 5: Verification:** Byte-identical SHA-256 match on `tiny` and `sample`, achieving 25.05 ms runtime (54.0x speedup) 🟢
+- [x] **Iteration 6: Sparse/Dense Hybrid Posting Overhaul:** Adaptive thresholding (`N / 32`), compact contiguous sorted `uint32_t` postings for rare terms, two-pointer linear intersection in 15 ns, streaming candidate verification. Squeezed full-scale RAM from 2,405 MB down to ~34 MB (<42 MB target), achieving 33.78 ms wall time and passing all 15 unit tests 🟢
 
 ---
 

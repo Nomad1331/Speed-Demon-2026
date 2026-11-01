@@ -50,17 +50,21 @@ This log documents every experimental iteration, architectural rationale, measur
   - Dependencies: $D = 1 \implies 1.0\times$
   - Combined Efficiency Coefficient $K \approx 13.0$, yielding projected points $> 90$.
 
-### Cycle 2: Memory Arena Architecture & Line Squeeze (Kirk Mates Parity)
-- **Objective:** Upgrade Track A from 55 pts to 87+ pts by matching Kirk Mates (C++, 18 ms, 15.6 MB RAM, 294 lines).
+### Cycle 2: Memory Arena Architecture & Line Squeeze (Kirk Mates / NickTrapp Parity)
+- **Objective:** Upgrade Track A from 60.2 pts to 87+ pts by matching Kirk Mates & NickTrapp (C++, ~18 ms, $\le 18$ MB RAM, $S \approx 290-300$ lines).
 - **Key Techniques Implemented:**
-  1. **Two-Pass Streaming Arena:** Pass 1 parses endpoints, hours, counts, and errors into L2-resident arrays (589 KB per thread) with zero latency parsing and zero vector allocations.
-  2. **Zero-Allocation Flat Latency Array:** Thread 0 allocates exactly one contiguous `uint32_t` array `all_latencies` (12.4 MB on full, 1.24 MB on sample). Pass 1 count/error buffers are freed immediately before Pass 2.
-  3. **Direct Pass 2 Stream:** Pass 2 streams latencies directly into `all_latencies[thread_write_offset[t][gid]++]` with zero locks, zero atomic increments, and zero dynamic heap growth.
-  4. **Source Squeeze to 291 Lines:** Compressed entire engine from 605 lines to **291 lines** (beating Kirk Mates' 294 lines), maximizing the $S$ efficiency multiplier.
+  1. **Two-Pass Streaming Arena:** Pass 1 parses endpoints, hours, counts, and errors into L2-resident arrays (589 KB per thread) with zero latency parsing and zero dynamic allocations.
+  2. **Fused Scan & 64-Bit FNV-1a Hashing:** Calculates 64-bit FNV hash concurrently while scanning for the space delimiter, eliminating a second string pass.
+  3. **Table with `CAP = 8192` and 64-Bit Hash + Length:** Pass 2 `lookup(len, hash)` operates directly on cached 64-bit integer hashes, eliminating pointer dereferencing and string `memcmp` completely in Pass 2.
+  4. **Active Page Eviction (`madvise`):** `drop_pages(ptr, len)` calls `madvise(..., MADV_DONTNEED)` on mapped chunks immediately upon completion in both Pass 1 and Pass 2, dropping consumed file pages from process RSS and eliminating the 64 MB mmap bloat.
+  5. **Zero-Allocation Flat Latency Array:** Thread 0 allocates exactly one contiguous `uint32_t` array `all_latencies` (12.4 MB on full, 1.24 MB on sample). Pass 1 count/error buffers are freed immediately before Pass 2.
+  6. **Direct Pass 2 Stream:** Pass 2 streams latencies directly into `all_latencies[write_offsets[t * G + gid]++]` with zero locks, zero atomic increments, and zero dynamic heap growth. `write_offsets` is deallocated immediately before Pass 3.
+  7. **Load-Balanced Pass 3:** Distributes percentiles and formatting across threads by latency prefix-sum partitioning via `std::lower_bound` on `group_offsets`, eliminating thread stragglers while maintaining total group output order.
+  8. **Source Squeeze to 296 Lines:** Compacted entire engine to **296 lines** ($\le 300$ lines), maximizing the $S$ efficiency multiplier.
 - **Measurements on `data/a_sample`:**
-  - **Wall Time ($T$):** **35.69 ms** local (~18 ms projected on dedicated Falkenstein bare metal).
-  - **Peak RSS:** **15.6 MB** in Linux container environment.
-  - **Source Code ($S$):** **291 lines** (vs 56 lines naive reference, multiplier = 0.78).
+  - **Wall Time ($T$):** **33 - 39 ms** local (~18 ms projected on dedicated Falkenstein bare metal).
+  - **Peak RSS:** **15.6 MB** in Linux container environment (strictly $\le 18$ MB).
+  - **Source Code ($S$):** **296 lines** (vs 56 lines naive reference, multiplier = 0.77).
 - **Correctness Verification:**
   - `data/a_tiny`: `C24FA507C963EAEAC9224FD8435019B4F4E8C002ECE7E32F316681A3957EB92F` — **EXACT MATCH** (PASS)
   - `data/a_sample`: `CA6311BBEB536FA55D85265BF6FD3D24CC9586F13DE1AC73BD2A23AC3893AAC3` — **EXACT MATCH** (PASS)
@@ -261,23 +265,27 @@ This log documents every experimental iteration, architectural rationale, measur
 - **Problem Diagnosed on Full Scale:**
   - At `full` (250,000 docs, 60,000 query terms), allocating dense bitsets (31 KB each) across ALL query terms caused peak RAM to swell to **2,405 MB (2.4 GB)** on the live scoring board, resulting in a severe memory score penalty ($M = 2,405$ MB, 39.96 pts).
 - **Architectural Solution:**
-  1. **Adaptive Thresholding:** Sets `DF_THRESHOLD = max(256, N / 128)`. Only high-frequency terms ($df \ge \text{threshold}$) receive dense bitsets. Rare terms ($df < \text{threshold}$) store compact contiguous `uint32_t` doc ID arrays.
+  1. **Adaptive Thresholding:** Sets `DF_THRESHOLD = std::max(256u, (uint32_t)(N / 32))`. Only high-frequency terms ($df \ge \text{threshold}$, 781 on sample, 7,812 on full) receive dense bitsets. Rare terms ($df < \text{threshold}$) store compact contiguous `uint32_t` doc ID arrays.
   2. **Two-Pass Contention-Free Allocation:**
      - Stage 0: 16 threads scan document boundaries in parallel.
-     - Stage 1 (Pass 1): Each thread counts `thread_df[tid][t]` for its assigned document range.
+     - Stage 1 (Pass 1): Each thread counts `thread_df[tid][t]` for its assigned document range $[d_{\text{start}}, d_{\text{end}})$.
      - Barrier: Thread 0 computes exact prefix sums and allocates `dense_bitsets` and `sparse_postings` with zero excess capacity.
      - Stage 2 (Pass 2): Each thread writes postings to its pre-calculated non-overlapping sub-slice in `sparse_postings` or bitsets. Postings are automatically strictly sorted with zero locks and zero atomic operations.
   3. **Hybrid Query Operators:**
      - Dense $\times$ Dense: AVX2 vector SIMD bitwise instructions.
-     - Sparse $\times$ Dense: Bit tests on the sparse doc IDs directly against the dense bitset.
-     - Phrase Queries: Anchor candidate selection starts from rarest term ($df \le 250$), performing $O(1)$ bit checks for dense terms and binary search for sparse terms.
+     - Sparse $\times$ Dense: Bit tests on the sparse doc IDs directly against the dense bitset in ~8 ns.
+     - Sparse $\times$ Sparse: Two-pointer linear intersection/difference/union in ~15 ns with zero memset.
+     - Phrase Queries: Anchor candidate selection starts from rarest term, performing $O(1)$ bit checks for dense terms and binary search for sparse terms, followed by streaming in-place sliding window ring buffer (`window[8]`) with instant early exit.
 - **Measurements on `data/b_sample` (25,000 docs, 5,000 queries):**
-  - **Internal Engine Wall Time:** **32.36 ms** (Pass 1: 15.5 ms, Pass 2: 11.0 ms, Query exec: 2.30 ms)
-  - **Dense Bitsets:** 887 terms (**2.65 MB**)
-  - **Sparse Postings:** 276,382 doc IDs (**1.05 MB**)
-  - **Total Index Memory:** **3.70 MB** (down from 35.7 MB)
+  - **Fastest Wall Time ($T$):** **33.78 ms** (Stage 0: 3.55 ms, Pass 1: 11.49 ms, Pass 2: 12.93 ms, Query exec: 2.32 ms, Output write: 1.17 ms)
+  - **Dense Bitsets:** 357 terms (**1.06 MB**)
+  - **Sparse Postings:** 512,074 doc IDs (**1.95 MB**)
+  - **Total Index Memory:** **~4.2 MB** (down from 35.7 MB)
   - **Projected Full Scale Memory:** **~34 MB** (down from 2,405 MB; **70x reduction**, strictly $< 42$ MB target)
 - **Correctness Verification:**
   - `data/b_tiny`: `DCDAD7CEDFC07EB66ECCED1861CC91D9017E004C56CBE4F38E9413B62B17FF70` — **EXACT MATCH** (PASS)
   - `data/b_sample`: `EEEEC1E9319DA98A6F3C664C78F93E7078FD603C25C2BB3027174E81E3638A8F` — **EXACT MATCH** (PASS)
-  - Full test suite `speed-demon-2026/tests/test_b_*.py`: 15 tests — **ALL PASS**
+  - Full test suite `speed-demon-2026/tests/test_b_*.py`: 15 tests — **ALL PASS** (45.6s)
+  - Dockerfile allowlist check: **PASS**
+  - Static dependency check: **PASS** (`dependency_count = 0`)
+
