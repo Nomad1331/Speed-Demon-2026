@@ -107,16 +107,15 @@ struct EndpointTable {
     }
 };
 
-struct ReqItem { uint16_t ep_id; uint16_t hid; uint32_t lat; };
+struct ReqItem { uint32_t lat; uint16_t ep_id; uint8_t hid; uint8_t is_err; };
 
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
     std::vector<ReqItem> local_reqs;
-    std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
     std::string out_buffer;
-    ThreadData() : counts(MAX_H * MAX_EP, 0), errors(MAX_H * MAX_EP, 0) { local_endpoints.reserve(2048); }
+    ThreadData() { local_endpoints.reserve(2048); }
 };
 
 inline int get_hour_id(const char* p) {
@@ -138,7 +137,7 @@ int main(int argc, char* argv[]) {
     std::string hour_strings[H];
     { size_t idx = 0; auto add_h = [&](const char* pr, int s, int e) { for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; } };
       add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17); }
-    unsigned int nthreads = (mf.size < 100000) ? 1u : std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+    unsigned int nthreads = (mf.size < 100000) ? 1u : std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
     struct Chunk { size_t start = 0, end = 0; };
     std::vector<Chunk> chunks(nthreads);
     for (unsigned int i = 0; i < nthreads; ++i) {
@@ -149,6 +148,7 @@ int main(int argc, char* argv[]) {
     }
     std::vector<ThreadData> tdata(nthreads);
     std::vector<std::string> global_endpoints; size_t N = 0, G = 0;
+    std::unique_ptr<std::atomic<uint32_t>[]> atomic_counts, atomic_errors;
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
     std::vector<size_t> group_offsets;
     std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
@@ -174,13 +174,11 @@ int main(int argc, char* argv[]) {
             uint16_t ep_len = (uint16_t)(cur - ep_start);
             uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
             uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
-            size_t idx = (size_t)hid * MAX_EP + ep_id;
-            td.counts[idx]++;
-            if (cur[1] == '5') td.errors[idx]++;
+            uint8_t is_err = (cur[1] == '5');
             cur += 5;
             uint32_t lat = (uint8_t)(*cur++ - '0');
             while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
-            td.local_reqs.push_back({ep_id, (uint16_t)hid, lat});
+            td.local_reqs.push_back({lat, ep_id, (uint8_t)hid, is_err});
             while (cur < end && (*cur == '\r' || *cur == '\n')) ++cur;
             p = cur;
         }
@@ -200,37 +198,37 @@ int main(int argc, char* argv[]) {
                 tdata[ot].ep_remap.resize(tdata[ot].local_endpoints.size());
                 for (size_t i = 0; i < tdata[ot].local_endpoints.size(); ++i)
                     tdata[ot].ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), tdata[ot].local_endpoints[i]) - global_endpoints.begin());
+                tdata[ot].local_endpoints.clear(); tdata[ot].local_endpoints.shrink_to_fit();
             }
-            if (N > 0) {
-                global_counts.assign(G, 0); global_errors.assign(G, 0);
-                for (unsigned int ot = 0; ot < nthreads; ++ot) {
-                    size_t lep_count = tdata[ot].local_endpoints.size();
-                    for (size_t h = 0; h < H; ++h) {
-                        size_t b_src = h * MAX_EP, b_dst = h * N;
-                        for (size_t lep = 0; lep < lep_count; ++lep) {
-                            uint32_t c = tdata[ot].counts[b_src + lep];
-                            if (c) {
-                                size_t ggid = b_dst + tdata[ot].ep_remap[lep];
-                                global_counts[ggid] += c; global_errors[ggid] += tdata[ot].errors[b_src + lep];
-                            }
-                        }
-                    }
-                    tdata[ot].counts.clear(); tdata[ot].counts.shrink_to_fit();
-                    tdata[ot].errors.clear(); tdata[ot].errors.shrink_to_fit();
-                    tdata[ot].local_endpoints.clear(); tdata[ot].local_endpoints.shrink_to_fit();
-                }
-                group_offsets.resize(G + 1, 0);
-                for (size_t g = 0; g < G; ++g) group_offsets[g + 1] = group_offsets[g] + global_counts[g];
-                all_latencies.resize(group_offsets[G]);
-                atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
-                for (size_t g = 0; g < G; ++g) atomic_write_offsets[g].store((uint32_t)group_offsets[g], std::memory_order_relaxed);
-            }
+            if (G > 0) { atomic_counts = std::make_unique<std::atomic<uint32_t>[]>(G); atomic_errors = std::make_unique<std::atomic<uint32_t>[]>(G); }
             mf.close();
         }
         sync_point.arrive_and_wait();
 
         if (N == 0) return;
         const auto& remap = td.ep_remap;
+        for (const auto& req : td.local_reqs) {
+            uint32_t ggid = (uint32_t)req.hid * N + remap[req.ep_id];
+            atomic_counts[ggid].fetch_add(1, std::memory_order_relaxed);
+            if (req.is_err) atomic_errors[ggid].fetch_add(1, std::memory_order_relaxed);
+        }
+        sync_point.arrive_and_wait();
+
+        if (t == 0) {
+            global_counts.resize(G); global_errors.resize(G); group_offsets.resize(G + 1, 0);
+            atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
+            size_t total = 0;
+            for (size_t g = 0; g < G; ++g) {
+                uint32_t c = atomic_counts[g].load(std::memory_order_relaxed);
+                global_counts[g] = c; global_errors[g] = atomic_errors[g].load(std::memory_order_relaxed);
+                group_offsets[g] = total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed);
+                total += c;
+            }
+            group_offsets[G] = total; all_latencies.resize(total);
+            atomic_counts.reset(); atomic_errors.reset();
+        }
+        sync_point.arrive_and_wait();
+
         for (const auto& req : td.local_reqs) {
             uint32_t ggid = (uint32_t)req.hid * N + remap[req.ep_id];
             uint32_t pos = atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed);
@@ -272,5 +270,6 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
     FILE* f = fopen(out_path.string().c_str(), "wb"); if (!f) return 1;
     for (unsigned int t = 0; t < nthreads; ++t) if (!tdata[t].out_buffer.empty()) fwrite(tdata[t].out_buffer.data(), 1, tdata[t].out_buffer.size(), f);
-    fclose(f); return 0;
+    fclose(f);
+    return 0;
 }
