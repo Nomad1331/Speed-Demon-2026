@@ -111,11 +111,27 @@ struct TermTable {
     std::vector<TermSlot> slots;
     uint32_t mask = 0, num_terms = 0;
 
-    void init(size_t cap) {
+    void init(size_t cap = 65536) {
         size_t sz = 1; while (sz < cap) sz <<= 1;
-        slots.resize(sz); mask = (uint32_t)(sz - 1); num_terms = 0;
+        slots.assign(sz, TermSlot{}); mask = (uint32_t)(sz - 1); num_terms = 0;
     }
+
+    void grow() {
+        size_t new_sz = slots.size() * 2;
+        std::vector<TermSlot> old_slots = std::move(slots);
+        slots.assign(new_sz, TermSlot{});
+        mask = (uint32_t)(new_sz - 1);
+        for (auto& s : old_slots) {
+            if (s.term_id != UINT32_MAX) {
+                uint32_t idx = s.hash & mask;
+                while (slots[idx].term_id != UINT32_MAX) idx = (idx + 1) & mask;
+                slots[idx] = std::move(s);
+            }
+        }
+    }
+
     inline uint32_t get_or_insert(const char* s, uint32_t len, uint32_t crc) {
+        if (num_terms * 2 >= slots.size()) grow();
         uint32_t idx = crc & mask;
         while (true) {
             if (slots[idx].term_id == UINT32_MAX) {
@@ -216,7 +232,7 @@ int main(int argc, char** argv) {
     if (!queries_file.open(queries_path)) return 1;
 
     TermTable term_table;
-    term_table.init(32768);
+    term_table.init(65536);
     std::vector<Query> queries;
     queries.reserve(65536);
 
