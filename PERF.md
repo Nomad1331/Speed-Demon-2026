@@ -189,6 +189,24 @@ This log documents every experimental iteration, architectural rationale, measur
 
 ---
 
+### Cycle 3: VFS Inode Lock Elimination & 4-Word Atomic Bitset Deduplication (`track-c/main.cpp`)
+- **Live Leaderboard Score:** Commit `f3bbc53`
+  - **Points:** **66.161 pts** (previous best: 58.788 pts, **+7.37 pts gain**)
+  - **Latency ($T$):** **0.0744 s (74.4 ms)** (down from 0.1012 s, **-26.8 ms latency reduction**)
+  - **Peak Memory ($M$):** **15.06 MB** (down from 36.38 MB, **>2.4x RAM drop**)
+  - **Source Lines ($S$):** **489 lines** (down from 528 lines)
+  - **Efficiency Coefficient ($K$):** **21.048** (previous: 14.988)
+- **Bottlenecks Eradicated:**
+  1. **Inner Loop VFS Lock:** Worker threads previously called `posix_fadvise` and `madvise` every 512 KB, taking the kernel VFS inode lock and serializing execution across all 12 hardware threads. Removing these inner-loop syscalls restored thread scaling.
+  2. **Monolithic 3.1M Name Buffering:** Replaced thread-local vectors storing 3.1M names and post-barrier `std::sort` with a global 262,144-slot open-addressing table holding `std::atomic<uint64_t> seen[4]` (256-bit mask for 241 countries).
+  3. **Streaming Direct CRC32:** CSV name characters are streamed directly into `_mm_crc32_u8` in CPU registers, eliminating stack buffer copying.
+  4. **Parallel Mapped Output:** Memory-mapped `aggregates.txt` directly across worker threads via `ftruncate` and `mmap`.
+- **Correctness Verification:**
+  - `data/c_tiny`: `e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733` — **EXACT MATCH** (PASS)
+  - `data/c_sample`: `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66` — **EXACT MATCH** (PASS)
+
+---
+
 ## Track D: Traverse
 
 ### Baseline: Naive Python Reference (`track-d/d_traverse.py`)
