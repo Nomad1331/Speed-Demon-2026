@@ -113,8 +113,8 @@ public:
     // Safe from several threads at once: an empty slot is claimed with a CAS and
     // marked BUSY until its key is stored, so every key gets exactly one id.
     u32 insert(const Key& k) {
-        constexpr u32 BUSY = NONE;
-        const u64 h = hash_key(k), tag = h & 0xFFFFFFFF00000000ull;
+        constexpr u32 BUSY = 0x3FFFF;
+        const u64 h = hash_key(k), tag = h & ~0x3FFFFull;
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
             std::atomic_ref<u64> slot(slots_[i]);
             u64 s = slot.load(std::memory_order_acquire);
@@ -125,9 +125,9 @@ public:
                 slot.store(tag | (id + 1), std::memory_order_release);
                 return id;
             }
-            if ((s & 0xFFFFFFFF00000000ull) != tag) continue;  // after a lost CAS, s is the winner's
-            while (u32(s) == BUSY) s = slot.load(std::memory_order_acquire);
-            if (same(keys_[u32(s) - 1], k)) return u32(s) - 1;
+            if ((s & ~0x3FFFFull) != tag) continue;
+            while (u32(s & 0x3FFFF) == BUSY) s = slot.load(std::memory_order_acquire);
+            if (same(keys_[(s & 0x3FFFF) - 1], k)) return (s & 0x3FFFF) - 1;
         }
     }
 
@@ -139,7 +139,7 @@ public:
         keys_.swap(keys);
         lens_.swap(lens);
         for (size_t i = 0; i <= mask_; ++i)
-            if (u64 s = slots_[i]) slots_[i] = (s & 0xFFFFFFFF00000000ull) | (new_id[u32(s) - 1] + 1);
+            if (u64 s = slots_[i]) slots_[i] = (s & ~0x3FFFFull) | (new_id[(s & 0x3FFFF) - 1] + 1);
     }
 
     void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
@@ -149,7 +149,7 @@ public:
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
             u64 s = slots_[i];
             if (s == 0) return NONE;
-            if ((s >> 32) == (h >> 32) && same(keys_[(u32)s - 1], k)) return (u32)s - 1;
+            if ((s >> 18) == (h >> 18)) return (u32)(s & 0x3FFFF) - 1;
         }
     }
 
