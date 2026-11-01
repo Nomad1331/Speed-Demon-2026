@@ -787,9 +787,21 @@ private:
     void apply_dense(char op, Postings b) {
         if (b.bits) {
             const size_t n = bm_.size();
-            if (op == 'A') for (size_t w = 0; w < n; ++w) bm_[w] &= b.bits[w];
-            else if (op == 'O') for (size_t w = 0; w < n; ++w) bm_[w] |= b.bits[w];
-            else for (size_t w = 0; w < n; ++w) bm_[w] &= ~b.bits[w];
+            size_t w = 0;
+            for (; w + 4 <= n; w += 4) {
+                __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&bm_[w]));
+                __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&b.bits[w]));
+                __m256i res;
+                if (op == 'A') res = _mm256_and_si256(va, vb);
+                else if (op == 'O') res = _mm256_or_si256(va, vb);
+                else res = _mm256_andnot_si256(vb, va);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(&bm_[w]), res);
+            }
+            for (; w < n; ++w) {
+                if (op == 'A') bm_[w] &= b.bits[w];
+                else if (op == 'O') bm_[w] |= b.bits[w];
+                else bm_[w] &= ~b.bits[w];
+            }
         } else if (op == 'A') {
             // Never larger than the list: back to list form.
             cur_.clear();
@@ -869,6 +881,7 @@ private:
         if (dense_) {
             for (size_t w = 0; w < bm_.size(); ++w) {
                 u64 bits = bm_[w];
+                if (!bits) continue;
                 u64 c = __builtin_popcountll(bits);
                 count += c;
                 sum += c * 64 * w + position_sum(bits);

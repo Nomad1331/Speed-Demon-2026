@@ -166,8 +166,8 @@ int main(int argc, char* argv[]) {
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf_records.size < 200000) nthreads = 1;
 
-    // 64 pieces for dynamic work stealing
-    const unsigned int num_pieces = (nthreads == 1) ? 1 : 64;
+    // 96 pieces for dynamic work stealing (8 pieces per thread)
+    const unsigned int num_pieces = (nthreads == 1) ? 1 : 96;
     std::vector<Chunk> chunks(num_pieces);
     chunks[0].start = ptr0;
     if (num_pieces == 1) chunks[0].end = file_end;
@@ -342,6 +342,9 @@ int main(int argc, char* argv[]) {
                 _mm_prefetch(reinterpret_cast<const char*>(&g_slots[probe_idx]), _MM_HINT_T0);
                 if (region_id < 1000000) {
                     _mm_prefetch(reinterpret_cast<const char*>(&region_to_country[region_id]), _MM_HINT_T0);
+                    uint8_t pre_cid = region_to_country[region_id];
+                    size_t seen_idx = (size_t)pre_cid * WORDS_PER_COUNTRY + (probe_idx >> 6);
+                    __builtin_prefetch(&g_seen_bits[seen_idx], 1);
                 }
 
                 size_t ring_slot = ring_count % LAG;
