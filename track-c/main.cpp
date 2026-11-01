@@ -8,16 +8,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <immintrin.h>
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#endif
 
 static const char DIGITS_LUT[] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 inline char* write_u64(char* p, uint64_t v) {
@@ -35,50 +29,37 @@ inline char* format_money(char* p, int64_t c) {
     *p++ = '0' + (frac / 10); *p++ = '0' + (frac % 10); return p;
 }
 
-inline uint32_t hash_bytes_crc32(const char* s, size_t len) {
-    uint32_t h = (uint32_t)len;
-    while (len >= 8) { uint64_t v; memcpy(&v, s, 8); h = (uint32_t)_mm_crc32_u64(h, v); s += 8; len -= 8; }
-    if (len >= 4) { uint32_t v; memcpy(&v, s, 4); h = _mm_crc32_u32(h, v); s += 4; len -= 4; }
-    while (len > 0) { h = _mm_crc32_u8(h, (uint8_t)*s++); len--; }
-    return h;
-}
-
 struct MappedFile {
-    const char* data = nullptr; size_t size = 0;
-#ifdef _WIN32
-    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
-    bool open(const std::string& path) {
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER fs; GetFileSizeEx(hFile, &fs); size = (size_t)fs.QuadPart; if (!size) return true;
-        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        return (data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0)) != nullptr;
-    }
-    ~MappedFile() { if (data) UnmapViewOfFile(data); if (hMap) CloseHandle(hMap); if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile); }
-#else
-    int fd = -1;
+    const char* data = nullptr; size_t size = 0; int fd = -1;
     bool open(const std::string& path) {
         fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) return false;
         struct stat st; fstat(fd, &st); size = (size_t)st.st_size; if (!size) return true;
         data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0); return data != MAP_FAILED;
     }
-    ~MappedFile() { if (data && data != MAP_FAILED) munmap((void*)data, size); if (fd >= 0) ::close(fd); }
-#endif
+    void close() {
+        if (data && data != MAP_FAILED) { ::munmap((void*)data, size); data = nullptr; }
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    ~MappedFile() { close(); }
 };
 
-#ifndef _WIN32
-inline void evict_range(int fd, const char* base, const char* start, const char* end) {
-    uintptr_t s = ((uintptr_t)start + 4095ULL) & ~4095ULL, e = ((uintptr_t)end) & ~4095ULL;
-    if (e > s) {
-        madvise((void*)s, e - s, MADV_DONTNEED);
-        if (fd >= 0) posix_fadvise(fd, (off_t)(s - (uintptr_t)base), (off_t)(e - s), POSIX_FADV_DONTNEED);
-    }
-}
-#endif
-struct LocalCountryAgg { uint64_t count = 0, name_bytes = 0, note_bytes = 0; int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0; };
-struct ThreadData { LocalCountryAgg countries[241]; std::vector<uint64_t> my_names; uint32_t c_offset[242]; std::string out_buf; };
+struct alignas(8) NameSlot {
+    std::atomic<uint64_t> hash{0};
+    std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
+};
+
+static constexpr size_t HASH_CAP = 1 << 18;
+static constexpr size_t HASH_MASK = HASH_CAP - 1;
+
+struct LocalCountryAgg {
+    uint64_t count = 0, name_bytes = 0, note_bytes = 0;
+    int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0;
+    uint32_t distinct_names = 0;
+};
+struct ThreadData { LocalCountryAgg countries[241]; };
 static uint8_t region_to_country[1000000];
 struct Chunk { const char* start = nullptr; const char* end = nullptr; };
+
 int main(int argc, char* argv[]) {
     std::string data_dir = "/data", out_arg = "/out";
     for (int i = 1; i < argc; ++i) {
@@ -87,6 +68,7 @@ int main(int argc, char* argv[]) {
     }
     std::filesystem::path out_path = out_arg.ends_with(".txt") ? std::filesystem::path(out_arg) : std::filesystem::path(out_arg) / "aggregates.txt";
     std::filesystem::create_directories(out_path.parent_path());
+
     MappedFile mf_regions; if (!mf_regions.open((std::filesystem::path(data_dir) / "regions.csv").string())) return 1;
     const char* rptr = mf_regions.data, *rend = mf_regions.data + mf_regions.size;
     while (rptr < rend && *rptr != '\n') rptr++;
@@ -98,8 +80,7 @@ int main(int argc, char* argv[]) {
         while (p < rend && *p != ',') p++;
         if (p >= rend) break;
         p++;
-        char c0 = p[0], c1 = p[1], c2 = p[2];
-        uint16_t pack = (uint16_t)(((c0 - 'A') * 26 + (c1 - 'A')) * 26 + (c2 - 'A'));
+        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
         if (!seen[pack]) { seen[pack] = true; unique_codes.push_back(((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2]); }
         p += 3; while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
@@ -125,13 +106,16 @@ int main(int argc, char* argv[]) {
         p += 3; while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
     }
-#ifndef _WIN32
-    if (mf_regions.size > 0) evict_range(mf_regions.fd, mf_regions.data, mf_regions.data, mf_regions.data + mf_regions.size);
-#endif
+    mf_regions.close();
+
+    NameSlot* name_table = (NameSlot*)::mmap(NULL, sizeof(NameSlot) * HASH_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (name_table == MAP_FAILED) return 1;
+
     MappedFile mf_records; if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
     const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
     if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
-    while (ptr0 < file_end && *ptr0 != '\n') ptr0++; if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
+    while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
+    if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u); if (mf_records.size < 200000) nthreads = 1;
     std::vector<Chunk> chunks(nthreads);
     chunks[0].start = ptr0;
@@ -159,46 +143,37 @@ int main(int argc, char* argv[]) {
     }
 
     uint8_t out_order[241]; for (uint16_t i = 0; i < num_countries; ++i) out_order[i] = (uint8_t)(i + 1); out_order[num_countries] = 0;
-    std::vector<ThreadData> tdata(nthreads); std::barrier sync_point(nthreads);
+    std::vector<ThreadData> tdata(nthreads);
+    std::vector<size_t> thread_output_bytes(nthreads, 0), thread_output_offsets(nthreads, 0);
+    std::barrier sync_point(nthreads);
+    char* out_mmap_ptr = nullptr;
+    size_t total_out_size = 0;
+    int out_fd = -1;
 
     auto worker_fn = [&](unsigned int t) {
-        const char* ptr = chunks[t].start, *chunk_end = chunks[t].end, *last_evicted = ptr;
+        const char* ptr = chunks[t].start, *chunk_end = chunks[t].end;
         auto& my_countries = tdata[t].countries;
-        auto& my_names = tdata[t].my_names;
-        my_names.reserve((chunk_end - ptr) / 45 + 1024);
-        char unesc[256];
         __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
 
         while (ptr < chunk_end) {
-            if (__builtin_expect(ptr - last_evicted >= 524288, 0)) {
-#ifndef _WIN32
-                evict_range(mf_records.fd, mf_records.data, last_evicted, ptr);
-#endif
-                last_evicted = ptr;
-            }
             if (ptr + 3 <= chunk_end && (uint8_t)ptr[0] == 0xef && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
-
             uint64_t id = (uint8_t)(*ptr++ - '0');
             while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
             ptr++;
-
-            uint32_t name_hash; size_t name_len;
+            uint32_t crc = 0; size_t name_len = 0;
             if (__builtin_expect(*ptr == '"', 1)) {
-                ptr++; char* up = unesc;
+                ptr++;
                 while (true) {
                     char c = *ptr++;
-                    if (__builtin_expect(c != '"', 1)) *up++ = c;
-                    else { if (*ptr == '"') { ptr++; *up++ = '"'; } else break; }
+                    if (__builtin_expect(c != '"', 1)) { crc = _mm_crc32_u8(crc, (uint8_t)c); name_len++; }
+                    else { if (*ptr == '"') { ptr++; crc = _mm_crc32_u8(crc, '"'); name_len++; } else break; }
                 }
                 ptr++;
-                name_len = (size_t)(up - unesc);
-                name_hash = hash_bytes_crc32(unesc, name_len);
             } else {
-                const char* start = ptr;
-                while (*ptr != ',') ptr++;
-                name_len = (size_t)(ptr - start); ptr++;
-                name_hash = hash_bytes_crc32(start, name_len);
+                while (*ptr != ',') { crc = _mm_crc32_u8(crc, (uint8_t)*ptr++); name_len++; }
+                ptr++;
             }
+            uint64_t name_hash = ((uint64_t)name_len << 32) | crc;
 
             size_t note_len = 0;
             if (__builtin_expect(*ptr == '"', 1)) {
@@ -242,54 +217,86 @@ int main(int argc, char* argv[]) {
             else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
             agg.count++; agg.id_sum += (int64_t)id; agg.amount_sum += cents;
             agg.name_bytes += name_len; agg.note_bytes += note_len;
-            my_names.push_back(((uint64_t)cid << 32) | name_hash);
+
+            uint64_t nh = name_hash ? name_hash : 1;
+            size_t idx = (nh ^ (nh >> 16)) & HASH_MASK;
+            NameSlot* entry = nullptr;
+            while (true) {
+                uint64_t cur = name_table[idx].hash.load(std::memory_order_relaxed);
+                if (cur == nh) { entry = &name_table[idx]; break; }
+                if (cur == 0) {
+                    uint64_t expected = 0;
+                    if (name_table[idx].hash.compare_exchange_strong(expected, nh, std::memory_order_relaxed)) {
+                        entry = &name_table[idx]; break;
+                    }
+                    if (expected == nh) { entry = &name_table[idx]; break; }
+                }
+                idx = (idx + 1) & HASH_MASK;
+            }
+            uint32_t word = cid >> 6;
+            uint64_t mask = 1ULL << (cid & 63);
+            if (!(entry->seen[word].fetch_or(mask, std::memory_order_relaxed) & mask)) {
+                agg.distinct_names++;
+            }
         }
-        std::sort(my_names.begin(), my_names.end());
-        my_names.erase(std::unique(my_names.begin(), my_names.end()), my_names.end());
-        my_names.shrink_to_fit();
-        size_t ucount = my_names.size();
-        auto& c_offset = tdata[t].c_offset; memset(c_offset, 0, sizeof(c_offset));
-        for (size_t i = 0; i < ucount; ++i) c_offset[(my_names[i] >> 32) + 1]++;
-        for (int i = 1; i <= 241; ++i) c_offset[i] += c_offset[i - 1];
-#ifndef _WIN32
-        evict_range(mf_records.fd, mf_records.data, last_evicted, chunk_end);
-#endif
+
         sync_point.arrive_and_wait();
+        if (t == 0) mf_records.close();
+
         uint16_t total_c = num_countries + 1, idx_start = (uint16_t)(((uint32_t)total_c * t) / nthreads), idx_end = (uint16_t)(((uint32_t)total_c * (t + 1)) / nthreads);
-        char line_buf[256]; auto& out_buf = tdata[t].out_buf; out_buf.reserve((idx_end - idx_start) * 64);
-        std::vector<uint32_t> all_names; all_names.reserve(2048);
+        char local_buf[4096]; char* p_out = local_buf;
         for (uint16_t idx = idx_start; idx < idx_end; ++idx) {
             uint8_t c = out_order[idx];
             uint64_t count = 0, name_bytes = 0, note_bytes = 0; int64_t id_sum = 0, amt_sum = 0, amt_min = INT64_MAX, amt_max = INT64_MIN;
-            all_names.clear();
+            uint32_t distinct_names = 0;
             for (unsigned int ot = 0; ot < nthreads; ++ot) {
                 const auto& o = tdata[ot].countries[c];
                 if (!o.count) continue;
                 count += o.count; id_sum += o.id_sum; amt_sum += o.amount_sum;
                 amt_min = std::min(amt_min, o.amount_min); amt_max = std::max(amt_max, o.amount_max);
                 name_bytes += o.name_bytes; note_bytes += o.note_bytes;
-                size_t start = tdata[ot].c_offset[c], end = tdata[ot].c_offset[c + 1];
-                for (size_t k = start; k < end; ++k) all_names.push_back((uint32_t)tdata[ot].my_names[k]);
+                distinct_names += o.distinct_names;
             }
             if (!count) continue;
 
-            std::sort(all_names.begin(), all_names.end());
-            uint32_t distinct_names = (uint32_t)(std::unique(all_names.begin(), all_names.end()) - all_names.begin());
-
-            char* p_out = line_buf; const std::string& name = country_names[c];
+            const std::string& name = country_names[c];
             memcpy(p_out, name.data(), name.size()); p_out += name.size(); *p_out++ = ' ';
             p_out = write_u64(p_out, count); *p_out++ = ' '; p_out = write_i64(p_out, id_sum); *p_out++ = ' ';
             p_out = format_money(p_out, amt_sum); *p_out++ = ' '; p_out = format_money(p_out, amt_min); *p_out++ = ' ';
             p_out = format_money(p_out, amt_max); *p_out++ = ' '; p_out = write_u64(p_out, distinct_names); *p_out++ = ' ';
             p_out = write_u64(p_out, name_bytes); *p_out++ = ' '; p_out = write_u64(p_out, note_bytes); *p_out++ = '\n';
-            out_buf.append(line_buf, p_out - line_buf);
+        }
+
+        size_t my_bytes = (size_t)(p_out - local_buf);
+        thread_output_bytes[t] = my_bytes;
+        sync_point.arrive_and_wait();
+
+        if (t == 0) {
+            size_t total_bytes = 0;
+            for (unsigned int ot = 0; ot < nthreads; ++ot) {
+                thread_output_offsets[ot] = total_bytes;
+                total_bytes += thread_output_bytes[ot];
+            }
+            total_out_size = total_bytes;
+            out_fd = ::open(out_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+            if (out_fd >= 0 && total_bytes > 0) {
+                ftruncate(out_fd, total_bytes);
+                out_mmap_ptr = (char*)::mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
+            }
+        }
+        sync_point.arrive_and_wait();
+
+        if (out_mmap_ptr && my_bytes > 0) {
+            memcpy(out_mmap_ptr + thread_output_offsets[t], local_buf, my_bytes);
         }
     };
 
     std::vector<std::thread> workers; workers.reserve(nthreads - 1);
     for (unsigned int t = 1; t < nthreads; ++t) workers.emplace_back(worker_fn, t);
     worker_fn(0); for (auto& w : workers) w.join();
-    FILE* f = fopen(out_path.string().c_str(), "wb"); if (!f) return 1;
-    for (unsigned int t = 0; t < nthreads; ++t) if (!tdata[t].out_buf.empty()) fwrite(tdata[t].out_buf.data(), 1, tdata[t].out_buf.size(), f);
-    fclose(f); return 0;
+
+    if (out_mmap_ptr && out_mmap_ptr != MAP_FAILED) munmap(out_mmap_ptr, total_out_size);
+    if (out_fd >= 0) ::close(out_fd);
+    munmap(name_table, sizeof(NameSlot) * HASH_CAP);
+    return 0;
 }
