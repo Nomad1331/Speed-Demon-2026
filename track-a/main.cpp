@@ -31,15 +31,6 @@ inline char* write_u32_fast(char* p, uint32_t val) {
     size_t len = (buf + 12) - b; memcpy(p, b, len); return p + len;
 }
 
-inline void append_line(std::string& out, const std::string& h, const std::string_view& ep, uint32_t count, uint32_t p50, uint32_t p95, uint32_t p99, uint32_t errs, uint32_t ppm) {
-    char buf[512], *p = buf;
-    memcpy(p, h.data(), h.size()); p += h.size(); *p++ = ' '; memcpy(p, ep.data(), ep.size()); p += ep.size(); *p++ = ' ';
-    p = write_u32_fast(p, count); *p++ = ' '; p = write_u32_fast(p, p50); *p++ = ' ';
-    p = write_u32_fast(p, p95); *p++ = ' '; p = write_u32_fast(p, p99); *p++ = ' ';
-    p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n';
-    out.append(buf, p - buf);
-}
-
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
@@ -104,10 +95,7 @@ struct SharedEpTable {
                 uint32_t expected = 0;
                 if (slots[idx].lock.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
                     uint16_t id = ep_count.fetch_add(1, std::memory_order_relaxed);
-                    slots[idx].hash = h;
-                    slots[idx].offset = (uint32_t)file_offset;
-                    slots[idx].len = len;
-                    slots[idx].id = id;
+                    slots[idx].hash = h; slots[idx].offset = (uint32_t)file_offset; slots[idx].len = len; slots[idx].id = id;
                     slots[idx].lock.store(2, std::memory_order_release);
                     return id;
                 }
@@ -133,7 +121,7 @@ inline int get_hour_id(const char* p) {
     return ((p[6] == '0') ? (d - 30) : (d + 1)) * 24 + h - 18;
 }
 
-struct GroupSummary { uint32_t count = 0, p50 = 0, p95 = 0, p99 = 0, errors = 0, ppm = 0; };
+struct GroupQuantiles { uint32_t p50 = 0, p95 = 0, p99 = 0; };
 
 int main(int argc, char* argv[]) {
     std::string data_dir = "/data", out_dir = "/out";
@@ -145,10 +133,12 @@ int main(int argc, char* argv[]) {
     std::filesystem::create_directories(out_dir);
     MappedFile mf;
     if (!mf.open(in_path.string()) || mf.size == 0) { FILE* f = fopen(out_path.string().c_str(), "wb"); if (f) fclose(f); return 0; }
+
     static const size_t H = 72;
     std::string hour_strings[H];
     { size_t idx = 0; auto add_h = [&](const char* pr, int s, int e) { for (int h = s; h <= e; ++h) { char buf[32]; snprintf(buf, sizeof(buf), "%sT%02d:00:00Z", pr, h); hour_strings[idx++] = buf; } };
       add_h("2026-10-30", 18, 23); add_h("2026-10-31", 0, 23); add_h("2026-11-01", 0, 23); add_h("2026-11-02", 0, 17); }
+
     unsigned int nthreads = (mf.size < 100000) ? 1u : std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
     struct Chunk { size_t start = 0, end = 0; };
     std::vector<Chunk> chunks(nthreads);
@@ -163,14 +153,14 @@ int main(int argc, char* argv[]) {
     auto atomic_counts = std::make_unique<std::atomic<uint32_t>[]>(RAW_G);
     auto atomic_errors = std::make_unique<std::atomic<uint32_t>[]>(RAW_G);
     for (size_t i = 0; i < RAW_G; ++i) { atomic_counts[i].store(0, std::memory_order_relaxed); atomic_errors[i].store(0, std::memory_order_relaxed); }
+
     std::vector<std::string_view> sorted_endpoints;
     std::vector<uint16_t> ep_remap;
     size_t N = 0, G = 0;
     std::vector<uint32_t> global_counts, global_errors, all_latencies;
     std::vector<size_t> group_offsets;
-    std::vector<GroupSummary> summaries;
+    std::vector<GroupQuantiles> quantiles;
     std::unique_ptr<std::atomic<uint32_t>[]> atomic_write_offsets;
-    std::vector<std::string> out_buffers(nthreads);
     std::barrier sync_point(nthreads);
 
     auto worker_fn = [&](unsigned int t) {
@@ -214,7 +204,13 @@ int main(int argc, char* argv[]) {
                 ep_remap[refs[i].orig_id] = i;
             }
             global_counts.assign(G, 0); global_errors.assign(G, 0);
-            for (size_t h = 0; h < H; ++h) {
+        }
+        sync_point.arrive_and_wait();
+
+        // Parallel counts remapping across threads
+        if (N > 0) {
+            size_t h_start = (H * t) / nthreads, h_end = (H * (t + 1)) / nthreads;
+            for (size_t h = h_start; h < h_end; ++h) {
                 size_t base = h * MAX_EP;
                 for (size_t ep = 0; ep < N; ++ep) {
                     uint32_t c = atomic_counts[base + ep].load(std::memory_order_relaxed);
@@ -225,6 +221,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+        }
+        sync_point.arrive_and_wait();
+
+        if (t == 0) {
             atomic_counts.reset(); atomic_errors.reset();
             group_offsets.resize(G + 1, 0); atomic_write_offsets = std::make_unique<std::atomic<uint32_t>[]>(G);
             size_t total = 0;
@@ -232,7 +232,7 @@ int main(int argc, char* argv[]) {
                 group_offsets[g] = (uint32_t)total; atomic_write_offsets[g].store((uint32_t)total, std::memory_order_relaxed); total += global_counts[g];
             }
             group_offsets[G] = (uint32_t)total; all_latencies.resize(total);
-            summaries.resize(G);
+            quantiles.resize(G);
         }
         sync_point.arrive_and_wait();
 
@@ -279,24 +279,7 @@ int main(int argc, char* argv[]) {
                     std::nth_element(begin, begin + r50, begin + r95); p50 = begin[r50];
                 }
             }
-            uint32_t errs = global_errors[g], ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / n);
-            summaries[g] = { (uint32_t)n, p50, p95, p99, errs, ppm };
-        }
-        sync_point.arrive_and_wait();
-
-        if (t == 0) {
-            all_latencies.clear(); all_latencies.shrink_to_fit();
-            global_counts.clear(); global_counts.shrink_to_fit();
-            global_errors.clear(); global_errors.shrink_to_fit();
-        }
-        sync_point.arrive_and_wait();
-
-        auto& out = out_buffers[t]; out.reserve(1024 * 1024);
-        for (size_t g = g_s; g < g_e; ++g) {
-            const auto& s = summaries[g];
-            if (s.count == 0) continue;
-            size_t h = g / N, gep = g % N;
-            append_line(out, hour_strings[h], sorted_endpoints[gep], s.count, s.p50, s.p95, s.p99, s.errors, s.ppm);
+            quantiles[g] = { p50, p95, p99 };
         }
     };
 
@@ -305,8 +288,39 @@ int main(int argc, char* argv[]) {
     worker_fn(0);
     for (auto& w : workers) w.join();
 
-    FILE* f = fopen(out_path.string().c_str(), "wb"); if (!f) return 1;
-    for (unsigned int t = 0; t < nthreads; ++t) if (!out_buffers[t].empty()) fwrite(out_buffers[t].data(), 1, out_buffers[t].size(), f);
+    all_latencies.clear(); all_latencies.shrink_to_fit();
+
+    FILE* f = fopen(out_path.string().c_str(), "wb");
+    if (!f) return 1;
+    char chunk[65536];
+    char* p = chunk;
+    char* chunk_end = chunk + sizeof(chunk) - 512;
+
+    for (size_t g = 0; g < G; ++g) {
+        uint32_t count = global_counts[g];
+        if (count == 0) continue;
+        size_t h = g / N, gep = g % N;
+        const auto& h_str = hour_strings[h];
+        const auto& ep = sorted_endpoints[gep];
+        const auto& q = quantiles[g];
+        uint32_t errs = global_errors[g];
+        uint32_t ppm = (uint32_t)(((uint64_t)errs * 1000000ULL) / count);
+
+        memcpy(p, h_str.data(), h_str.size()); p += h_str.size(); *p++ = ' ';
+        memcpy(p, ep.data(), ep.size()); p += ep.size(); *p++ = ' ';
+        p = write_u32_fast(p, count); *p++ = ' ';
+        p = write_u32_fast(p, q.p50); *p++ = ' ';
+        p = write_u32_fast(p, q.p95); *p++ = ' ';
+        p = write_u32_fast(p, q.p99); *p++ = ' ';
+        p = write_u32_fast(p, errs); *p++ = ' ';
+        p = write_u32_fast(p, ppm); *p++ = '\n';
+
+        if (p >= chunk_end) {
+            fwrite(chunk, 1, p - chunk, f);
+            p = chunk;
+        }
+    }
+    if (p > chunk) fwrite(chunk, 1, p - chunk, f);
     fclose(f);
     return 0;
 }
