@@ -60,17 +60,25 @@ struct MappedFile {
     bool open(const std::string& path) {
         fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) return false;
         struct stat st; fstat(fd, &st); size = (size_t)st.st_size; if (!size) return true;
-        data = (const char*)::mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0); return data != MAP_FAILED;
+        data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0); return data != MAP_FAILED;
     }
     ~MappedFile() { if (data && data != MAP_FAILED) munmap((void*)data, size); if (fd >= 0) ::close(fd); }
 #endif
 };
 
+#ifndef _WIN32
+inline void evict_range(int fd, const char* base, const char* start, const char* end) {
+    uintptr_t s = ((uintptr_t)start + 4095ULL) & ~4095ULL, e = ((uintptr_t)end) & ~4095ULL;
+    if (e > s) {
+        madvise((void*)s, e - s, MADV_DONTNEED);
+        if (fd >= 0) posix_fadvise(fd, (off_t)(s - (uintptr_t)base), (off_t)(e - s), POSIX_FADV_DONTNEED);
+    }
+}
+#endif
 struct LocalCountryAgg { uint64_t count = 0, name_bytes = 0, note_bytes = 0; int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0; };
 struct ThreadData { LocalCountryAgg countries[241]; std::vector<uint64_t> my_names; uint32_t c_offset[242]; std::string out_buf; };
 static uint8_t region_to_country[1000000];
 struct Chunk { const char* start = nullptr; const char* end = nullptr; };
-
 int main(int argc, char* argv[]) {
     std::string data_dir = "/data", out_arg = "/out";
     for (int i = 1; i < argc; ++i) {
@@ -83,7 +91,6 @@ int main(int argc, char* argv[]) {
     const char* rptr = mf_regions.data, *rend = mf_regions.data + mf_regions.size;
     while (rptr < rend && *rptr != '\n') rptr++;
     if (rptr < rend && *rptr == '\n') rptr++;
-
     bool seen[26 * 26 * 26] = {false};
     std::vector<uint32_t> unique_codes; unique_codes.reserve(256);
     const char* p = rptr;
@@ -119,14 +126,12 @@ int main(int argc, char* argv[]) {
         if (p < rend && *p == '\n') p++;
     }
 #ifndef _WIN32
-    if (mf_regions.size > 0) madvise((void*)mf_regions.data, mf_regions.size, MADV_DONTNEED);
+    if (mf_regions.size > 0) evict_range(mf_regions.fd, mf_regions.data, mf_regions.data, mf_regions.data + mf_regions.size);
 #endif
-
     MappedFile mf_records; if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
     const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
     if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
     while (ptr0 < file_end && *ptr0 != '\n') ptr0++; if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
-
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u); if (mf_records.size < 200000) nthreads = 1;
     std::vector<Chunk> chunks(nthreads);
     chunks[0].start = ptr0;
@@ -167,8 +172,7 @@ int main(int argc, char* argv[]) {
         while (ptr < chunk_end) {
             if (__builtin_expect(ptr - last_evicted >= 524288, 0)) {
 #ifndef _WIN32
-                uintptr_t s = ((uintptr_t)last_evicted + 4095ULL) & ~4095ULL, e = ((uintptr_t)ptr) & ~4095ULL;
-                if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                evict_range(mf_records.fd, mf_records.data, last_evicted, ptr);
 #endif
                 last_evicted = ptr;
             }
@@ -240,26 +244,20 @@ int main(int argc, char* argv[]) {
             agg.name_bytes += name_len; agg.note_bytes += note_len;
             my_names.push_back(((uint64_t)cid << 32) | name_hash);
         }
-
         std::sort(my_names.begin(), my_names.end());
         my_names.erase(std::unique(my_names.begin(), my_names.end()), my_names.end());
         my_names.shrink_to_fit();
         size_t ucount = my_names.size();
-
         auto& c_offset = tdata[t].c_offset; memset(c_offset, 0, sizeof(c_offset));
         for (size_t i = 0; i < ucount; ++i) c_offset[(my_names[i] >> 32) + 1]++;
         for (int i = 1; i <= 241; ++i) c_offset[i] += c_offset[i - 1];
-
 #ifndef _WIN32
-        uintptr_t s = ((uintptr_t)last_evicted + 4095ULL) & ~4095ULL, e = ((uintptr_t)chunk_end) & ~4095ULL;
-        if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+        evict_range(mf_records.fd, mf_records.data, last_evicted, chunk_end);
 #endif
         sync_point.arrive_and_wait();
-
         uint16_t total_c = num_countries + 1, idx_start = (uint16_t)(((uint32_t)total_c * t) / nthreads), idx_end = (uint16_t)(((uint32_t)total_c * (t + 1)) / nthreads);
         char line_buf[256]; auto& out_buf = tdata[t].out_buf; out_buf.reserve((idx_end - idx_start) * 64);
         std::vector<uint32_t> all_names; all_names.reserve(2048);
-
         for (uint16_t idx = idx_start; idx < idx_end; ++idx) {
             uint8_t c = out_order[idx];
             uint64_t count = 0, name_bytes = 0, note_bytes = 0; int64_t id_sum = 0, amt_sum = 0, amt_min = INT64_MAX, amt_max = INT64_MIN;

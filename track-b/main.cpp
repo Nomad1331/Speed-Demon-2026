@@ -93,7 +93,7 @@ struct MappedFile {
         if (fstat(fd, &st) < 0) { ::close(fd); fd = -1; return false; }
         size = (size_t)st.st_size;
         if (size == 0) return true;
-        void* p = ::mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        void* p = ::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) { ::close(fd); fd = -1; return false; }
         data = (const char*)p;
 #ifdef MADV_SEQUENTIAL
@@ -472,18 +472,22 @@ int main(int argc, char** argv) {
 
 #ifndef _WIN32
                 if ((size_t)((uintptr_t)p - last_evicted) >= 524288) {
-                    uintptr_t s = last_evicted & ~4095ULL;
-                    uintptr_t e = (uintptr_t)p & ~4095ULL;
-                    if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                    uintptr_t s = last_evicted & ~4095ULL, e = (uintptr_t)p & ~4095ULL;
+                    if (e > s) {
+                        madvise((void*)s, e - s, MADV_DONTNEED);
+                        posix_fadvise(docs_file.fd, (off_t)(s - (uintptr_t)docs_file.data), (off_t)(e - s), POSIX_FADV_DONTNEED);
+                    }
                     last_evicted = (uintptr_t)p;
                 }
 #endif
             }
 #ifndef _WIN32
             if ((uintptr_t)p > last_evicted) {
-                uintptr_t s = last_evicted & ~4095ULL;
-                uintptr_t e = (uintptr_t)p & ~4095ULL;
-                if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                uintptr_t s = last_evicted & ~4095ULL, e = (uintptr_t)p & ~4095ULL;
+                if (e > s) {
+                    madvise((void*)s, e - s, MADV_DONTNEED);
+                    posix_fadvise(docs_file.fd, (off_t)(s - (uintptr_t)docs_file.data), (off_t)(e - s), POSIX_FADV_DONTNEED);
+                }
             }
 #endif
 
@@ -518,6 +522,7 @@ int main(int argc, char** argv) {
                 sparse_postings = (uint32_t*)malloc((size_t)(total_sparse_postings > 0 ? total_sparse_postings : 1) * sizeof(uint32_t));
 #ifndef _WIN32
                 madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
+                posix_fadvise(docs_file.fd, 0, (off_t)docs_file.size, POSIX_FADV_DONTNEED);
 #endif
             }
 
