@@ -1,266 +1,367 @@
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
-#include <fstream>
-#include <functional>
-#include <future>
-#include <iostream>
-#include <limits>
-#include <map>
-#include <memory_resource>
-#include <new>
-#include <stdexcept>
+#include <immintrin.h>
 #include <string>
-#include <string_view>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
-namespace fs = std::filesystem;
-using i64 = std::int64_t;
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
-struct Text {
-    std::string_view encoded;
-    std::size_t size;
-};
+static const char DIGITS_LUT[] =
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
 
-// Outer quotes are omitted, but doubled quotes stay in the view. This encoding
-// is canonical for a decoded name (an unquoted CSV field cannot contain quotes).
-bool read_text(const char*& p, const char* end, Text& field) {
-    bool quoted = *p == '"';
-    if (quoted) ++p;
-    const char* begin = p;
-    std::size_t escaped = 0;
-    for (;;) {
-        const char* stop = static_cast<const char*>(std::memchr(p, quoted ? '"' : ',', end - p));
-        if (!stop) return false;
-        p = stop + 1;
-        if (quoted && *p == '"') {
-            ++escaped;
-            ++p;
-            continue;
-        }
-        field.encoded = {begin, static_cast<std::size_t>(stop - begin)};
-        field.size = field.encoded.size() - escaped;
-        return !quoted || *p++ == ',';
+inline char* write_u64(char* p, uint64_t v) {
+    if (v < 10) { *p++ = '0' + v; return p; }
+    char buf[24], *b = buf + 24;
+    while (v >= 100) {
+        uint64_t q = v / 100; uint32_t r = (uint32_t)(v - q * 100);
+        v = q; b -= 2; memcpy(b, &DIGITS_LUT[r * 2], 2);
     }
+    if (v < 10) *--b = '0' + v;
+    else { b -= 2; memcpy(b, &DIGITS_LUT[v * 2], 2); }
+    size_t len = (buf + 24) - b; memcpy(p, b, len); return p + len;
 }
 
-bool number(const char*& p, const char* end, char delimiter, i64& n) {
-    const auto result = std::from_chars(p, end, n);
-    p = result.ptr;
-    if (result.ec != std::errc{} || *p != delimiter) return false;
-    ++p;
-    return true;
+inline char* format_money(char* p, int64_t c) {
+    if (c < 0) { *p++ = '-'; c = -c; }
+    p = write_u64(p, (uint64_t)c / 100); *p++ = '.';
+    uint32_t frac = (uint32_t)((uint64_t)c % 100);
+    *p++ = '0' + (frac / 10); *p++ = '0' + (frac % 10); return p;
 }
 
-struct Row {
-    i64 id, region, amount;
-    Text name, note;
+struct MappedFile {
+    const char* data = nullptr; size_t size = 0; int fd = -1;
+    bool open(const std::string& path) {
+        fd = ::open(path.c_str(), O_RDONLY | O_BINARY); if (fd < 0) return false;
+        struct stat st; fstat(fd, &st); size = (size_t)st.st_size; if (!size) return true;
+        data = (const char*)::mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0); return data != MAP_FAILED;
+    }
+    void close() {
+        if (data && data != MAP_FAILED) { ::munmap((void*)data, size); data = nullptr; }
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    ~MappedFile() { close(); }
 };
 
-bool read_row(const char*& p, const char* end, bool final, Row& row) {
-    if (std::memcmp(p, "\xef\xbb\xbf", 3) == 0) p += 3;
-    if (!number(p, end, ',', row.id) || !read_text(p, end, row.name) ||
-        !read_text(p, end, row.note) || !number(p, end, ',', row.region)) return false;
-    bool negative = *p == '-';
-    if (negative) ++p;
-    i64 whole;
-    if (!number(p, end, '.', whole) || end - p < 2 || p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9')
-        return false;
-    row.amount = (negative ? -1 : 1) * (100 * whole + (p[0] - '0') * 10 + (p[1] - '0'));
-    p += 2;
-    if (*p == '\r') ++p;
-    if (p == end) return final;
-    return *p++ == '\n';
-}
+struct alignas(8) NameNode {
+    uint64_t hash = 0;
+    uint32_t next = 0;
+    std::atomic<uint64_t> seen[4]{{0}, {0}, {0}, {0}};
+};
 
-// Nodes are published once and retained until all parsing workers finish.
-// The table is an index: compare full keys to resolve every hash collision.
-class Distinct {
-    struct Name {
-        std::string_view text;
-        Name* previous;
-        std::atomic<std::uint64_t>* seen;
+static constexpr size_t BUCKETS_CAP = 1 << 17;
+static constexpr size_t BUCKETS_MASK = BUCKETS_CAP - 1;
+static std::atomic<uint32_t> bucket_heads[BUCKETS_CAP];
+static NameNode nodes_pool[262144];
+static std::atomic<uint32_t> node_alloc_ptr{1};
+
+struct LocalCountryAgg {
+    uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
+    int64_t amount_sum = 0, amount_min = 0, amount_max = 0;
+    uint32_t distinct_names = 0;
+};
+
+struct ThreadData { LocalCountryAgg countries[241]; };
+static ThreadData tdata[16];
+static uint8_t region_to_country[1000000];
+struct Chunk { const char* start = nullptr; const char* end = nullptr; };
+
+int main(int argc, char* argv[]) {
+    std::string data_dir = "/data", out_arg = "/out";
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg == "--data" && i + 1 < argc) data_dir = argv[++i];
+        else if (arg.starts_with("--data=")) data_dir = arg.substr(7);
+        else if (arg == "--out" && i + 1 < argc) out_arg = argv[++i];
+        else if (arg.starts_with("--out=")) out_arg = arg.substr(6);
+        else if (arg[0] != '-') {
+            if (data_dir == "/data") data_dir = argv[i];
+            else if (out_arg == "/out") out_arg = argv[i];
+        }
+    }
+    std::filesystem::path out_path = out_arg.ends_with(".txt") ? std::filesystem::path(out_arg) : std::filesystem::path(out_arg) / "aggregates.txt";
+    std::filesystem::create_directories(out_path.parent_path());
+
+    MappedFile mf_regions;
+    if (!mf_regions.open((std::filesystem::path(data_dir) / "regions.csv").string())) return 1;
+    const char* rptr = mf_regions.data, *rend = mf_regions.data + mf_regions.size;
+    while (rptr < rend && *rptr != '\n') rptr++;
+    if (rptr < rend && *rptr == '\n') rptr++;
+    bool seen[26 * 26 * 26] = {false};
+    uint32_t unique_codes[256]; uint16_t num_countries = 0;
+    const char* p = rptr;
+    while (p < rend) {
+        while (p < rend && *p != ',') p++;
+        if (p >= rend) break;
+        p++;
+        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
+        if (!seen[pack]) {
+            seen[pack] = true;
+            unique_codes[num_countries++] = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+        }
+        p += 3; while (p < rend && *p != '\n') p++;
+        if (p < rend && *p == '\n') p++;
+    }
+    std::sort(unique_codes, unique_codes + num_countries);
+    std::string country_names[241]; country_names[0] = "_UNMATCHED";
+    uint8_t code_to_cid[26 * 26 * 26] = {0};
+    for (uint16_t i = 0; i < num_countries; ++i) {
+        uint32_t cd = unique_codes[i];
+        country_names[i + 1] = std::string({(char)(cd >> 16), (char)((cd >> 8) & 0xFF), (char)(cd & 0xFF)});
+        code_to_cid[(uint16_t)((((cd >> 16) - 'A') * 26 + (((cd >> 8) & 0xFF) - 'A')) * 26 + ((cd & 0xFF) - 'A'))] = (uint8_t)(i + 1);
+    }
+    p = rptr;
+    while (p < rend) {
+        uint32_t rid = (uint8_t)(*p++ - '0');
+        while ((uint8_t)(*p - '0') <= 9) rid = rid * 10 + (uint8_t)(*p++ - '0');
+        if (p >= rend) break;
+        p++;
+        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
+        if (rid < 1000000) region_to_country[rid] = code_to_cid[pack];
+        p += 3; while (p < rend && *p != '\n') p++;
+        if (p < rend && *p == '\n') p++;
+    }
+    mf_regions.close();
+
+    MappedFile mf_records;
+    if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
+    madvise((void*)mf_records.data, mf_records.size, MADV_WILLNEED | MADV_SEQUENTIAL);
+    const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
+    if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
+    while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
+    if (ptr0 < file_end && *ptr0 == '\n') ptr0++;
+
+    unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
+    if (mf_records.size < 200000) nthreads = 1;
+    Chunk chunks[16]; chunks[0].start = ptr0;
+    if (nthreads == 1) chunks[0].end = file_end;
+    else {
+        __m256i v_cr = _mm256_set1_epi8('\r');
+        for (unsigned int i = 1; i < nthreads; ++i) {
+            const char* cur = mf_records.data + (mf_records.size * i) / nthreads;
+            while (cur + 32 < file_end) {
+                __m256i v = _mm256_loadu_si256((const __m256i*)cur);
+                uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_cr));
+                while (mask) {
+                    int idx = __builtin_ctz(mask);
+                    if (cur[idx + 1] == '\n') { cur += idx + 2; goto found_chunk; }
+                    mask &= mask - 1;
+                }
+                cur += 32;
+            }
+            while (cur + 1 < file_end && !(cur[0] == '\r' && cur[1] == '\n')) cur++;
+            cur = (cur + 1 < file_end) ? cur + 2 : file_end;
+        found_chunk: chunks[i].start = cur; chunks[i - 1].end = cur;
+        }
+        chunks[nthreads - 1].end = file_end;
+    }
+
+    uint8_t out_order[241];
+    for (uint16_t i = 0; i < num_countries; ++i) out_order[i] = (uint8_t)(i + 1);
+    out_order[num_countries] = 0;
+
+    auto worker_fn = [&](unsigned int t) {
+        const char* ptr = chunks[t].start, *chunk_end = chunks[t].end;
+        auto& my_countries = tdata[t].countries;
+        __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
+
+        while (ptr < chunk_end) {
+            if (__builtin_expect((uint8_t)*ptr == 0xef, 0)) {
+                if (ptr + 3 <= chunk_end && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
+            }
+            uint64_t id = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++;
+            uint32_t crc = 0; size_t name_len = 0;
+            if (__builtin_expect(*ptr == '"', 1)) {
+                ptr++;
+                if (ptr + 33 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                    if (mask) {
+                        int idx = __builtin_ctz(mask);
+                        if (ptr[idx + 1] == ',') {
+                            name_len = (size_t)idx;
+                            const char* cp = ptr;
+                            while (idx >= 8) {
+                                crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t*)cp);
+                                cp += 8; idx -= 8;
+                            }
+                            if (idx >= 4) {
+                                crc = _mm_crc32_u32(crc, *(const uint32_t*)cp);
+                                cp += 4; idx -= 4;
+                            }
+                            while (idx > 0) {
+                                crc = _mm_crc32_u8(crc, (uint8_t)*cp++);
+                                idx--;
+                            }
+                            ptr += name_len + 2;
+                            goto name_done;
+                        }
+                    }
+                }
+                while (true) {
+                    char c = *ptr++;
+                    if (__builtin_expect(c != '"', 1)) { crc = _mm_crc32_u8(crc, (uint8_t)c); name_len++; }
+                    else if (*ptr == '"') { ptr++; crc = _mm_crc32_u8(crc, '"'); name_len++; }
+                    else break;
+                }
+                ptr++;
+            } else {
+                while (*ptr != ',') { crc = _mm_crc32_u8(crc, (uint8_t)*ptr++); name_len++; }
+                ptr++;
+            }
+        name_done:
+            uint64_t name_hash = ((uint64_t)name_len << 32) | crc;
+
+            size_t note_len = 0;
+            if (__builtin_expect(*ptr == '"', 1)) {
+                ptr++;
+                if (ptr + 33 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                    if (m) {
+                        int idx = __builtin_ctz(m);
+                        if (ptr[idx + 1] == ',') {
+                            note_len = (size_t)idx;
+                            ptr += idx + 2;
+                            goto note_done;
+                        }
+                    }
+                }
+                while (true) {
+                    while (ptr + 32 <= chunk_end) {
+                        __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
+                        if (m) { note_len += __builtin_ctz(m); ptr += __builtin_ctz(m); break; }
+                        note_len += 32; ptr += 32;
+                    }
+                    char c = *ptr++;
+                    if (__builtin_expect(c != '"', 1)) note_len++;
+                    else if (*ptr == '"') { ptr++; note_len++; }
+                    else break;
+                }
+                ptr++;
+            } else {
+                const char* start = ptr;
+                while (ptr + 32 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
+                    if (m) { ptr += __builtin_ctz(m); break; }
+                    ptr += 32;
+                }
+                while (*ptr != ',') ptr++;
+                note_len = (size_t)(ptr - start); ptr++;
+            }
+        note_done:
+
+            uint32_t region_id = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++;
+            bool neg = (*ptr == '-'); ptr += neg;
+            int64_t cents = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
+            if (neg) cents = -cents;
+            if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
+
+            uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
+            LocalCountryAgg& agg = my_countries[cid];
+            if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
+            else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
+            agg.count++; agg.id_sum += id; agg.amount_sum += cents;
+            agg.name_bytes += name_len; agg.note_bytes += note_len;
+
+            uint64_t nh = name_hash ? name_hash : 1;
+            uint32_t b_idx = (uint32_t)((nh ^ (nh >> 16)) & BUCKETS_MASK);
+            uint32_t curr = bucket_heads[b_idx].load(std::memory_order_acquire);
+            NameNode* entry = nullptr;
+
+            while (curr != 0) {
+                if (nodes_pool[curr].hash == nh) { entry = &nodes_pool[curr]; break; }
+                curr = nodes_pool[curr].next;
+            }
+
+            if (!entry) {
+                uint32_t new_node = node_alloc_ptr.fetch_add(1, std::memory_order_relaxed);
+                nodes_pool[new_node].hash = nh;
+                curr = bucket_heads[b_idx].load(std::memory_order_relaxed);
+                while (true) {
+                    nodes_pool[new_node].next = curr;
+                    if (bucket_heads[b_idx].compare_exchange_weak(curr, new_node, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                        entry = &nodes_pool[new_node];
+                        break;
+                    }
+                    // If another thread inserted the same hash while we were allocating:
+                    uint32_t chk = curr;
+                    while (chk != 0) {
+                        if (nodes_pool[chk].hash == nh) { entry = &nodes_pool[chk]; break; }
+                        chk = nodes_pool[chk].next;
+                    }
+                    if (entry) break;
+                }
+            }
+
+            uint32_t word = cid >> 6;
+            uint64_t mask = 1ULL << (cid & 63);
+            uint64_t cur_bits = entry->seen[word].load(std::memory_order_relaxed);
+            if (__builtin_expect(!(cur_bits & mask), 0)) {
+                if (!(entry->seen[word].fetch_or(mask, std::memory_order_relaxed) & mask)) {
+                    agg.distinct_names++;
+                }
+            }
+        }
     };
-    std::vector<std::atomic<Name*>> buckets;
-    std::size_t words;
-public:
-    explicit Distinct(std::size_t countries) : buckets(1 << 17), words((countries + 63) / 64) {
-        for (auto& head : buckets) head.store(nullptr, std::memory_order_relaxed);
-    }
-    bool insert(std::size_t country, std::string_view name, std::pmr::monotonic_buffer_resource& arena) {
-        auto& bucket = buckets[std::hash<std::string_view>{}(name) & (buckets.size() - 1)];
-        auto* head = bucket.load(std::memory_order_acquire);
-        Name* fresh = nullptr;
-        Name* entry;
-        for (;;) {
-            entry = head;
-            while (entry && entry->text != name) entry = entry->previous;
-            if (entry) break;
-            if (!fresh) {
-                // A worker owns its arena throughout parsing; shared keys and
-                // bits outlive all workers. Allocation happens only on a miss.
-                auto* key = static_cast<char*>(arena.allocate(name.size() + 1, alignof(char)));
-                std::memcpy(key, name.data(), name.size());
-                auto* storage = arena.allocate(words * sizeof(std::atomic<std::uint64_t>), alignof(std::atomic<std::uint64_t>));
-                auto* bits = new(storage) std::atomic<std::uint64_t>[words]();
-                for (std::size_t i = 0; i < words; ++i) bits[i].store(0, std::memory_order_relaxed);
-                fresh = new(arena.allocate(sizeof(Name), alignof(Name))) Name{{key, name.size()}, nullptr, bits};
-            }
-            fresh->previous = head;
-            if (bucket.compare_exchange_strong(head, fresh, std::memory_order_acq_rel)) {
-                entry = fresh;
-                break;
-            }
+
+    std::vector<std::thread> workers; workers.reserve(nthreads - 1);
+    for (unsigned int t = 1; t < nthreads; ++t) workers.emplace_back(worker_fn, t);
+    worker_fn(0);
+    for (auto& w : workers) w.join();
+    mf_records.close();
+
+    char out_buf[65536]; char* p_out = out_buf;
+    for (uint16_t idx = 0; idx <= num_countries; ++idx) {
+        uint8_t c = out_order[idx];
+        uint64_t count = 0, name_bytes = 0, note_bytes = 0, id_sum = 0;
+        int64_t amt_sum = 0, amt_min = INT64_MAX, amt_max = INT64_MIN;
+        uint32_t distinct_names = 0;
+        for (unsigned int ot = 0; ot < nthreads; ++ot) {
+            const auto& o = tdata[ot].countries[c];
+            if (!o.count) continue;
+            count += o.count; id_sum += o.id_sum; amt_sum += o.amount_sum;
+            amt_min = std::min(amt_min, o.amount_min); amt_max = std::max(amt_max, o.amount_max);
+            name_bytes += o.name_bytes; note_bytes += o.note_bytes;
+            distinct_names += o.distinct_names;
         }
-        auto mask = std::uint64_t{1} << (country % 64);
-        auto& word = entry->seen[country / 64];
-        return !(word.load(std::memory_order_relaxed) & mask) &&
-               !(word.fetch_or(mask, std::memory_order_relaxed) & mask);
-    }
-};
+        if (!count) continue;
 
-struct Totals {
-    i64 count = 0, ids = 0, sum = 0;
-    i64 low = std::numeric_limits<i64>::max(), high = std::numeric_limits<i64>::min();
-    std::size_t n_names = 0, name_bytes = 0, note_bytes = 0;
-    void add(i64 id, i64 amount, bool fresh, std::size_t n, std::size_t m) {
-        ++count; ids += id; sum += amount;
-        low = std::min(amount, low); high = std::max(amount, high);
-        name_bytes += n; note_bytes += m;
-        n_names += fresh;
+        const std::string& name = country_names[c];
+        memcpy(p_out, name.data(), name.size()); p_out += name.size(); *p_out++ = ' ';
+        p_out = write_u64(p_out, count); *p_out++ = ' ';
+        p_out = write_u64(p_out, id_sum); *p_out++ = ' ';
+        p_out = format_money(p_out, amt_sum); *p_out++ = ' ';
+        p_out = format_money(p_out, amt_min); *p_out++ = ' ';
+        p_out = format_money(p_out, amt_max); *p_out++ = ' ';
+        p_out = write_u64(p_out, distinct_names); *p_out++ = ' ';
+        p_out = write_u64(p_out, name_bytes); *p_out++ = ' ';
+        p_out = write_u64(p_out, note_bytes); *p_out++ = '\n';
     }
-    void merge(const Totals& other) {
-        count += other.count; ids += other.ids; sum += other.sum;
-        low = std::min(low, other.low); high = std::max(high, other.high);
-        n_names += other.n_names; name_bytes += other.name_bytes; note_bytes += other.note_bytes;
-    }
-};
 
-
-std::string money(i64 value) {
-    auto absolute = value < 0 ? -value : value;
-    auto cents = absolute % 100;
-    return (value < 0 ? "-" : "") + std::to_string(absolute / 100) + (cents < 10 ? ".0" : ".") + std::to_string(cents);
-}
-
-void join(const fs::path& data, const fs::path& out) {
-    std::ifstream lookup(data / "regions.csv");
-    std::string row;
-    if (!std::getline(lookup, row) || row != "region_id,country") throw std::runtime_error("invalid regions header");
-    std::map<std::string, std::size_t> countries{{"_UNMATCHED", 0}};
-    std::vector<std::uint16_t> regions;
-    while (std::getline(lookup, row)) {
-        std::size_t id = 0;
-        auto [pos, ec] = std::from_chars(row.data(), row.data() + row.size(), id);
-        if (ec != std::errc{} || pos == row.data() + row.size() || *pos != ',') throw std::runtime_error("bad region id");
-        auto country = countries.try_emplace(std::string(pos + 1, row.data() + row.size() - pos - 1), countries.size()).first->second;
-        if (regions.size() <= id) regions.resize(id + 1);
-        regions[id] = country;
+    FILE* out_file = fopen(out_path.string().c_str(), "wb");
+    if (out_file) {
+        fwrite(out_buf, 1, (size_t)(p_out - out_buf), out_file);
+        fclose(out_file);
     }
-    std::vector<Totals> groups(countries.size());
-    Distinct distinct(groups.size());
-    const auto records = data / "records.csv";
-    std::ifstream input(records, std::ios::binary);
-    if (!std::getline(input, row)) throw std::runtime_error("missing records header");
-    if (row.compare(0, 3, "\xef\xbb\xbf") == 0) row.erase(0, 3);
-    if (!row.empty() && row.back() == '\r') row.pop_back();
-    if (row != "id,name,note,region_id,amount") throw std::runtime_error("invalid records header");
-
-    const auto size = fs::file_size(records);
-    const std::uint64_t offset = input.eof() ? size : static_cast<std::uint64_t>(input.tellg());
-    // Spec 2.2 guarantees that CR occurs only in CRLF record terminators.
-    // A bare LF inside a quoted note is therefore never used to split work.
-    std::vector<std::uint64_t> boundaries{offset};
-    unsigned workers = std::min<std::uint64_t>(8, 1 + size / (4 * 1024 * 1024));
-    for (unsigned i = 1; i < workers; ++i) {
-        auto cut = offset + (size - offset) * i / workers;
-        input.seekg(cut);
-        input.ignore(std::numeric_limits<std::streamsize>::max(), '\r');
-        if (!input.good()) break;
-        if (input.get() != '\n') throw std::runtime_error("invalid record break");
-        auto position = static_cast<std::uint64_t>(input.tellg());
-        if (position > boundaries.back() && position < size) boundaries.push_back(position);
-    }
-    boundaries.push_back(size);
-    std::vector<std::pmr::monotonic_buffer_resource> arenas(boundaries.size() - 1);
-    auto run = [&](std::size_t part) {
-        auto begin = boundaries[part], end = boundaries[part + 1];
-        std::ifstream input(records, std::ios::binary);
-        input.seekg(begin);
-        std::vector<Totals> local(countries.size());
-        std::uint64_t remaining = end - begin;
-        // A sentinel and two padding bytes make the EOF, BOM and quote lookahead
-        // safe. Carry an incomplete row to the next block, growing for long fields.
-        std::vector<char> buffer(256 * 1024 + 3);
-        std::size_t tail = 0;
-        for (;;) {
-            const auto take = std::min<std::uint64_t>(buffer.size() - 3 - tail, remaining);
-            input.read(buffer.data() + tail, take);
-            if (static_cast<std::uint64_t>(input.gcount()) != take) throw std::runtime_error("short CSV read");
-            remaining -= take;
-            if (input.bad()) throw std::runtime_error("records.csv read failed");
-            const bool final = remaining == 0;
-            const std::size_t size = tail + input.gcount();
-            std::memset(buffer.data() + size, 0, 3);
-            const char* p = buffer.data();
-            const char* end = p + size;
-            Row record;
-            while (p != end) {
-                const char* begin = p;
-                if (!read_row(p, end, final, record)) { p = begin; break; }
-                auto region = static_cast<std::size_t>(record.region);
-                auto country = region < regions.size() ? regions[region] : 0;
-                bool fresh = distinct.insert(country, record.name.encoded, arenas[part]);
-                local[country].add(record.id, record.amount, fresh, record.name.size, record.note.size);
-            }
-            tail = end - p;
-            if (final) {
-                if (tail) throw std::runtime_error("invalid CSV row");
-                break;
-            }
-            std::memmove(buffer.data(), p, tail);
-            if (tail == buffer.size() - 3) buffer.resize(2 * tail + 3);
-        }
-        return local;
-    };
-    std::vector<std::future<std::vector<Totals>>> jobs;
-    for (std::size_t i = 1; i < boundaries.size(); ++i)
-        jobs.push_back(std::async(std::launch::async, run, i - 1));
-    for (auto& job : jobs) {
-        auto local = job.get();
-        for (std::size_t i = 0; i < groups.size(); ++i) groups[i].merge(local[i]);
-    }
-    fs::create_directories(out);
-    std::ofstream output(out / "aggregates.txt", std::ios::binary);
-    for (const auto& [code, index] : countries) {
-        const auto& g = groups[index];
-        if (g.count) output << code << ' ' << g.count << ' ' << g.ids << ' ' << money(g.sum) << ' ' << money(g.low)
-                            << ' ' << money(g.high) << ' ' << g.n_names << ' ' << g.name_bytes << ' ' << g.note_bytes << '\n';
-    }
-    output.close();
-    if (!output) throw std::runtime_error("aggregates.txt write failed");
-}
-
-int main(int argc, char** argv) {
-    try {
-        std::string data_dir = "/data", out_dir = "/out";
-        for (int i = 1; i < argc; ++i) {
-            std::string_view arg = argv[i];
-            if (arg == "--data" && i + 1 < argc) data_dir = argv[++i];
-            else if (arg.starts_with("--data=")) data_dir = arg.substr(7);
-            else if (arg == "--out" && i + 1 < argc) out_dir = argv[++i];
-            else if (arg.starts_with("--out=")) out_dir = arg.substr(6);
-            else if (arg[0] != '-') {
-                if (data_dir == "/data") data_dir = argv[i];
-                else if (out_dir == "/out") out_dir = argv[i];
-            }
-        }
-        join(data_dir, out_dir);
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
+    _exit(0);
 }
