@@ -221,10 +221,14 @@ inline uint32_t extract_doc_terms(const char* dp, const char* text_end, const Te
             doc_terms_buf[num_doc_terms++] = term_id;
         }
     }
-    if (num_doc_terms > 0) {
-        std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
-        return (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
+    if (num_doc_terms <= 1) return num_doc_terms;
+    if (num_doc_terms == 2) {
+        if (doc_terms_buf[0] == doc_terms_buf[1]) return 1;
+        if (doc_terms_buf[0] > doc_terms_buf[1]) std::swap(doc_terms_buf[0], doc_terms_buf[1]);
+        return 2;
     }
+    std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
+    return (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
     return 0;
 }
 
@@ -433,6 +437,9 @@ int main(int argc, char** argv) {
             uint32_t doc_terms_buf[1024];
             std::vector<uint32_t> my_matches;
             my_matches.reserve(65536);
+#ifndef _WIN32
+            uintptr_t last_evicted = (uintptr_t)p;
+#endif
 
             while (p < docs_file.data + b_end && p < file_end) {
                 const char* tab_pos = find_char_avx2(p, file_end, '\t');
@@ -462,7 +469,23 @@ int main(int argc, char** argv) {
                     }
                 }
                 p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
+
+#ifndef _WIN32
+                if ((size_t)((uintptr_t)p - last_evicted) >= 524288) {
+                    uintptr_t s = last_evicted & ~4095ULL;
+                    uintptr_t e = (uintptr_t)p & ~4095ULL;
+                    if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                    last_evicted = (uintptr_t)p;
+                }
+#endif
             }
+#ifndef _WIN32
+            if ((uintptr_t)p > last_evicted) {
+                uintptr_t s = last_evicted & ~4095ULL;
+                uintptr_t e = (uintptr_t)p & ~4095ULL;
+                if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+            }
+#endif
 
             sync_point.arrive_and_wait();
 

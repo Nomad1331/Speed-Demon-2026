@@ -109,7 +109,8 @@ int main(int argc, char* argv[]) {
     }
     p = rptr;
     while (p < rend) {
-        uint32_t rid = 0; while (p < rend && *p >= '0') rid = rid * 10 + (*p++ - '0');
+        uint32_t rid = (uint8_t)(*p++ - '0');
+        while ((uint8_t)(*p - '0') <= 9) rid = rid * 10 + (uint8_t)(*p++ - '0');
         if (p >= rend) break;
         p++;
         uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
@@ -173,14 +174,12 @@ int main(int argc, char* argv[]) {
             }
             if (ptr + 3 <= chunk_end && (uint8_t)ptr[0] == 0xef && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
 
-            uint64_t id = 0; while (*ptr >= '0') id = id * 10 + (*ptr++ - '0'); ptr++;
+            uint64_t id = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++;
+
             uint32_t name_hash; size_t name_len;
-            if (__builtin_expect(*ptr != '"', 1)) {
-                const char* start = ptr;
-                while (*ptr != ',') ptr++;
-                name_len = (size_t)(ptr - start); ptr++;
-                name_hash = hash_bytes_crc32(start, name_len);
-            } else {
+            if (__builtin_expect(*ptr == '"', 1)) {
                 ptr++; char* up = unesc;
                 while (true) {
                     char c = *ptr++;
@@ -190,20 +189,15 @@ int main(int argc, char* argv[]) {
                 ptr++;
                 name_len = (size_t)(up - unesc);
                 name_hash = hash_bytes_crc32(unesc, name_len);
+            } else {
+                const char* start = ptr;
+                while (*ptr != ',') ptr++;
+                name_len = (size_t)(ptr - start); ptr++;
+                name_hash = hash_bytes_crc32(start, name_len);
             }
 
             size_t note_len = 0;
-            if (__builtin_expect(*ptr != '"', 1)) {
-                const char* start = ptr;
-                while (ptr + 32 <= chunk_end) {
-                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
-                    if (m) { ptr += __builtin_ctz(m); break; }
-                    ptr += 32;
-                }
-                while (*ptr != ',') ptr++;
-                note_len = (size_t)(ptr - start); ptr++;
-            } else {
+            if (__builtin_expect(*ptr == '"', 1)) {
                 ptr++;
                 while (true) {
                     while (ptr + 32 <= chunk_end) {
@@ -217,19 +211,32 @@ int main(int argc, char* argv[]) {
                     else { if (*ptr == '"') { ptr++; note_len++; } else break; }
                 }
                 ptr++;
+            } else {
+                const char* start = ptr;
+                while (ptr + 32 <= chunk_end) {
+                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
+                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
+                    if (m) { ptr += __builtin_ctz(m); break; }
+                    ptr += 32;
+                }
+                while (*ptr != ',') ptr++;
+                note_len = (size_t)(ptr - start); ptr++;
             }
 
-            uint32_t region_id = 0; while (*ptr >= '0') region_id = region_id * 10 + (*ptr++ - '0');
-            ptr++; bool neg = (*ptr == '-'); if (neg) ptr++;
-            int64_t cents = 0; while (*ptr >= '0') cents = cents * 10 + (*ptr++ - '0');
-            ptr++; cents = cents * 100 + (ptr[0] - '0') * 10 + (ptr[1] - '0'); ptr += 2; if (neg) cents = -cents;
-            if (ptr < chunk_end && *ptr == '\r') ptr++; if (ptr < chunk_end && *ptr == '\n') ptr++;
+            uint32_t region_id = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++; bool neg = (*ptr == '-'); ptr += neg;
+            int64_t cents = (uint8_t)(*ptr++ - '0');
+            while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
+            ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
+            if (neg) cents = -cents;
+            if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
 
             uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
             LocalCountryAgg& agg = my_countries[cid];
-            agg.count++; agg.id_sum += (int64_t)id; agg.amount_sum += cents;
-            if (agg.count == 1) { agg.amount_min = agg.amount_max = cents; }
+            if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
             else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
+            agg.count++; agg.id_sum += (int64_t)id; agg.amount_sum += cents;
             agg.name_bytes += name_len; agg.note_bytes += note_len;
             my_names.push_back(((uint64_t)cid << 32) | name_hash);
         }

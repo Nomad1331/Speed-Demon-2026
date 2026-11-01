@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #include <atomic>
 #include <memory>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -22,6 +23,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+
 static const char DIGITS_LUT[] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 inline char* write_u32_fast(char* p, uint32_t val) {
     if (val < 10) { *p++ = (char)('0' + val); return p; }
@@ -39,6 +41,7 @@ inline void append_line(std::string& out, const std::string& h, const std::strin
     p = write_u32_fast(p, errs); *p++ = ' '; p = write_u32_fast(p, ppm); *p++ = '\n';
     out.append(buf, p - buf);
 }
+
 struct MappedFile {
     const char* data = nullptr; size_t size = 0;
 #ifdef _WIN32
@@ -63,20 +66,21 @@ struct MappedFile {
     ~MappedFile() { if (data && data != MAP_FAILED) munmap((void*)data, size); if (fd >= 0) ::close(fd); }
 #endif
 };
+
 inline void evict_range(uintptr_t s, uintptr_t e) {
 #ifndef _WIN32
     s &= ~4095ULL; e &= ~4095ULL; if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
 #endif
 }
-template<char CH>
-inline const char* find_char_avx2(const char* cur, const char* end, __m256i tgt) {
+
+inline const char* find_space_avx2(const char* cur, const char* end, __m256i sp) {
     if (cur >= end) return end;
     while (cur + 32 <= end) {
-        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)cur), tgt));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)cur), sp));
         if (m) return cur + __builtin_ctz(m);
         cur += 32;
     }
-    while (cur < end && *cur != CH) ++cur; return cur;
+    while (cur < end && *cur != ' ') ++cur; return cur;
 }
 
 inline uint64_t hash_endpoint(const char* s, size_t len) {
@@ -88,7 +92,7 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct EpEntry { uint64_t hash = 0; uint32_t global_id = 0; uint16_t len = 0, local_id = 0; };
+struct EpEntry { uint64_t hash = 0; uint16_t len = 0, local_id = 0; };
 struct EndpointTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
     EpEntry entries[CAP];
@@ -99,21 +103,17 @@ struct EndpointTable {
             if (entries[idx].hash == h && entries[idx].len == len && !memcmp(eps[entries[idx].local_id].data(), s, len)) return entries[idx].local_id;
             idx = (idx + 1) & MASK;
         }
-        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, 0, len, lid}; return lid;
-    }
-    inline uint32_t lookup(uint16_t len, uint64_t h) const {
-        size_t idx = h & MASK;
-        while (true) {
-            if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].global_id;
-            idx = (idx + 1) & MASK;
-        }
+        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, len, lid}; return lid;
     }
 };
+
+struct LocalReq { uint32_t lat; uint16_t ep_id; uint8_t hid; };
 struct ThreadData {
     EndpointTable ep_table;
     std::vector<std::string> local_endpoints;
     std::vector<uint32_t> counts, errors;
     std::vector<uint16_t> ep_remap;
+    std::vector<LocalReq> local_reqs;
     std::string out_buffer;
     ThreadData() : counts(MAX_H * MAX_EP, 0), errors(MAX_H * MAX_EP, 0) { local_endpoints.reserve(2048); }
 };
@@ -157,8 +157,10 @@ int main(int argc, char* argv[]) {
         auto& td = tdata[t];
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         uint64_t last_tag = 0; int last_hid = -1;
-        __m256i sp = _mm256_set1_epi8(' '), nl = _mm256_set1_epi8('\n');
-        // Pass 1: AVX2 scanning of method, endpoint, status (pages stay in cache for Pass 2)
+        __m256i sp = _mm256_set1_epi8(' ');
+        td.local_reqs.reserve((chunks[t].end - chunks[t].start) / 45);
+
+        // Single Pass File Ingest: Parse method, endpoint, status, latency into local_reqs
         while (p < end) {
             if (p + 27 > end) break;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
@@ -168,18 +170,26 @@ int main(int argc, char* argv[]) {
             int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
             if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
             const char* ep_start = cur;
-            cur = find_char_avx2<' '>(cur, end, sp);
+            cur = find_space_avx2(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
             uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
             uint16_t ep_id = td.ep_table.lookup_or_insert(ep_start, ep_len, ep_hash, td.local_endpoints);
             size_t idx = (size_t)hid * MAX_EP + ep_id;
             td.counts[idx]++;
             if (cur[1] == '5') td.errors[idx]++;
-            p = find_char_avx2<'\n'>(cur + 5, end, nl) + 1;
+            cur += 5;
+            uint32_t lat = (uint8_t)(*cur++ - '0');
+            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
+            td.local_reqs.push_back({lat, ep_id, (uint8_t)hid});
+            if (*cur == '\r') ++cur;
+            if (*cur == '\n') ++cur;
+            p = cur;
         }
         sync_point.arrive_and_wait();
 
+        // Evict all file pages from OS page cache immediately after single file read
         if (t == 0) {
+            evict_range((uintptr_t)mf.data, (uintptr_t)mf.data + mf.size + 4095ULL);
             global_endpoints = tdata[0].local_endpoints;
             std::sort(global_endpoints.begin(), global_endpoints.end());
             for (unsigned int ot = 1; ot < nthreads; ++ot) {
@@ -195,7 +205,6 @@ int main(int argc, char* argv[]) {
         td.ep_remap.resize(td.local_endpoints.size());
         for (size_t i = 0; i < td.local_endpoints.size(); ++i)
             td.ep_remap[i] = (uint16_t)(std::lower_bound(global_endpoints.begin(), global_endpoints.end(), td.local_endpoints[i]) - global_endpoints.begin());
-        for (auto& entry : td.ep_table.entries) if (entry.hash) entry.global_id = td.ep_remap[entry.local_id];
         sync_point.arrive_and_wait();
         if (t == 0) {
             global_counts.assign(G, 0); global_errors.assign(G, 0);
@@ -220,41 +229,24 @@ int main(int argc, char* argv[]) {
             for (size_t g = 0; g < G; ++g) atomic_write_offsets[g].store((uint32_t)group_offsets[g], std::memory_order_relaxed);
         }
         sync_point.arrive_and_wait();
-        // Free per-thread counts/errors to reclaim thread arena memory
+
+        // Free counts/errors
         td.counts.clear(); td.counts.shrink_to_fit();
         td.errors.clear(); td.errors.shrink_to_fit();
         td.local_endpoints.clear(); td.local_endpoints.shrink_to_fit();
-        td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
-        sync_point.arrive_and_wait();
-        // Pass 2: AVX2 scanning and streaming latencies into flat all_latencies array
-        p = mf.data + chunks[t].start; last_hid = -1; last_tag = 0;
-        uintptr_t last_evict = (uintptr_t)p & ~4095ULL;
-        while (p < end) {
-            if (p + 27 > end) break;
-            uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
-            int hid = (cur_tag == last_tag) ? last_hid : get_hour_id(p);
-            if (cur_tag != last_tag) { last_tag = cur_tag; last_hid = hid; }
-            const char* cur = p + 28;
-            int off = (cur[3] == ' ') ? 4 : (cur[4] == ' ') ? 5 : (cur[5] == ' ') ? 6 : (cur[6] == ' ') ? 7 : (cur[7] == ' ') ? 8 : 0;
-            if (off) cur += off; else { while (*cur != ' ') ++cur; ++cur; }
-            const char* ep_start = cur;
-            cur = find_char_avx2<' '>(cur, end, sp);
-            uint16_t ep_len = (uint16_t)(cur - ep_start);
-            uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
-            uint32_t gep = td.ep_table.lookup(ep_len, ep_hash);
-            cur += 5;
-            uint32_t lat = (uint8_t)(*cur++ - '0');
-            while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');
-            size_t ggid = (size_t)hid * N + gep;
+
+        // Pass 2: In-memory scatter into flat all_latencies array (zero file I/O)
+        for (const auto& req : td.local_reqs) {
+            size_t ggid = (size_t)req.hid * N + td.ep_remap[req.ep_id];
             uint32_t pos = atomic_write_offsets[ggid].fetch_add(1, std::memory_order_relaxed);
-            all_latencies[pos] = lat;
-            if (*cur == '\r') ++cur; if (*cur == '\n') ++cur; p = cur;
-            if ((size_t)((uintptr_t)p - last_evict) >= 524288) { uintptr_t cp = (uintptr_t)p & ~4095ULL; evict_range(last_evict, cp); last_evict = cp; }
+            all_latencies[pos] = req.lat;
         }
-        evict_range(last_evict, ((uintptr_t)end + 4095ULL) & ~4095ULL);
+        td.local_reqs.clear(); td.local_reqs.shrink_to_fit();
+        td.ep_remap.clear(); td.ep_remap.shrink_to_fit();
         sync_point.arrive_and_wait();
         if (t == 0) atomic_write_offsets.reset();
         sync_point.arrive_and_wait();
+
         // Pass 3: Fully balanced percentiles and output formatting
         auto& out = td.out_buffer; out.reserve(512 * 1024);
         size_t total_lines = group_offsets[G];
