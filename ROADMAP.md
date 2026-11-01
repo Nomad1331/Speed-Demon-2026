@@ -44,6 +44,7 @@
 - [x] **Iteration 4: SLOC Compression:** Squeezed code to 332 lines matching NickTrapp's 303 lines 🟢
 - [x] **Iteration 5: Container Packaging & Validation:** Multi-stage Dockerfile matching GCC 16 allowlist and zero-dependency `.speed-demon.toml` validated with `dockerfile_check.py` 🟢
 - [x] **Iteration 6: Verification:** Byte-identical SHA-256 match on `tiny` and `sample`, achieving 21.01 ms runtime (~18 ms on scoring box, <13 MB RAM, projected 84+ pts) 🟢
+- [x] **Iteration 7: Hardware CRC32 + Zero-Alloc Packed uint64_t Pipeline:** Replaced serial FNV-1a with hardware CRC32 instruction (`_mm_crc32_u64`), packed `((cid << 32) | crc)` into a single flat `uint64_t` buffer per thread, eliminated all heap allocations and 241 dynamic vectors per thread. Compressed code from 332 to 290 SLOC (strictly $\le 300$). Verified byte-identical SHA-256 on tiny and sample. 🟢
 
 ---
 

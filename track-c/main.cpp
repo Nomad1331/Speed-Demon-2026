@@ -8,12 +8,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <immintrin.h>
-
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 #include <windows.h>
 #else
 #include <sys/mman.h>
@@ -36,6 +33,14 @@ inline char* format_money(char* p, int64_t c) {
     p = write_u64(p, (uint64_t)c / 100); *p++ = '.';
     uint32_t frac = (uint32_t)((uint64_t)c % 100);
     *p++ = '0' + (frac / 10); *p++ = '0' + (frac % 10); return p;
+}
+
+inline uint32_t hash_bytes_crc32(const char* s, size_t len) {
+    uint32_t h = (uint32_t)len;
+    while (len >= 8) { uint64_t v; memcpy(&v, s, 8); h = (uint32_t)_mm_crc32_u64(h, v); s += 8; len -= 8; }
+    if (len >= 4) { uint32_t v; memcpy(&v, s, 4); h = _mm_crc32_u32(h, v); s += 4; len -= 4; }
+    while (len > 0) { h = _mm_crc32_u8(h, (uint8_t)*s++); len--; }
+    return h;
 }
 
 struct MappedFile {
@@ -62,7 +67,7 @@ struct MappedFile {
 };
 
 struct LocalCountryAgg { uint64_t count = 0, name_bytes = 0, note_bytes = 0; int64_t id_sum = 0, amount_sum = 0, amount_min = 0, amount_max = 0; };
-struct ThreadData { LocalCountryAgg countries[241]; std::vector<uint64_t> country_names[241]; std::string out_buf; };
+struct ThreadData { LocalCountryAgg countries[241]; std::vector<uint64_t> my_names; uint32_t c_offset[242]; std::string out_buf; };
 static uint8_t region_to_country[1000000];
 struct Chunk { const char* start = nullptr; const char* end = nullptr; };
 
@@ -86,7 +91,8 @@ int main(int argc, char* argv[]) {
         while (p < rend && *p != ',') p++;
         if (p >= rend) break;
         p++;
-        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
+        char c0 = p[0], c1 = p[1], c2 = p[2];
+        uint16_t pack = (uint16_t)(((c0 - 'A') * 26 + (c1 - 'A')) * 26 + (c2 - 'A'));
         if (!seen[pack]) { seen[pack] = true; unique_codes.push_back(((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2]); }
         p += 3; while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
@@ -152,7 +158,9 @@ int main(int argc, char* argv[]) {
     auto worker_fn = [&](unsigned int t) {
         const char* ptr = chunks[t].start, *chunk_end = chunks[t].end, *last_evicted = ptr;
         auto& my_countries = tdata[t].countries;
-        auto& my_names = tdata[t].country_names;
+        auto& my_names = tdata[t].my_names;
+        my_names.reserve((chunk_end - ptr) / 45 + 1024);
+        char unesc[256];
         __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
 
         while (ptr < chunk_end) {
@@ -166,33 +174,22 @@ int main(int argc, char* argv[]) {
             if (ptr + 3 <= chunk_end && (uint8_t)ptr[0] == 0xef && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
 
             uint64_t id = 0; while (*ptr >= '0') id = id * 10 + (*ptr++ - '0'); ptr++;
-            uint64_t name_hash = 0xcbf29ce484222325ULL; size_t name_len = 0;
+            uint32_t name_hash; size_t name_len;
             if (__builtin_expect(*ptr != '"', 1)) {
                 const char* start = ptr;
-                while (ptr + 32 <= chunk_end) {
-                    __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_comma));
-                    if (m) { int pos = __builtin_ctz(m); for (int k = 0; k < pos; ++k) name_hash = (name_hash ^ (uint8_t)ptr[k]) * 0x100000001b3ULL; ptr += pos; break; }
-                    for (int k = 0; k < 32; ++k) name_hash = (name_hash ^ (uint8_t)ptr[k]) * 0x100000001b3ULL;
-                    ptr += 32;
-                }
-                while (*ptr != ',') { name_hash = (name_hash ^ (uint8_t)*ptr++) * 0x100000001b3ULL; }
+                while (*ptr != ',') ptr++;
                 name_len = (size_t)(ptr - start); ptr++;
+                name_hash = hash_bytes_crc32(start, name_len);
             } else {
-                ptr++;
+                ptr++; char* up = unesc;
                 while (true) {
-                    while (ptr + 32 <= chunk_end) {
-                        __m256i v = _mm256_loadu_si256((const __m256i*)ptr);
-                        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_quote));
-                        if (m) { int pos = __builtin_ctz(m); for (int k = 0; k < pos; ++k) name_hash = (name_hash ^ (uint8_t)ptr[k]) * 0x100000001b3ULL; name_len += pos; ptr += pos; break; }
-                        for (int k = 0; k < 32; ++k) name_hash = (name_hash ^ (uint8_t)ptr[k]) * 0x100000001b3ULL;
-                        name_len += 32; ptr += 32;
-                    }
                     char c = *ptr++;
-                    if (__builtin_expect(c != '"', 1)) { name_hash = (name_hash ^ (uint8_t)c) * 0x100000001b3ULL; name_len++; }
-                    else { if (*ptr == '"') { ptr++; name_hash = (name_hash ^ '"') * 0x100000001b3ULL; name_len++; } else break; }
+                    if (__builtin_expect(c != '"', 1)) *up++ = c;
+                    else { if (*ptr == '"') { ptr++; *up++ = '"'; } else break; }
                 }
                 ptr++;
+                name_len = (size_t)(up - unesc);
+                name_hash = hash_bytes_crc32(unesc, name_len);
             }
 
             size_t note_len = 0;
@@ -233,13 +230,18 @@ int main(int argc, char* argv[]) {
             agg.count++; agg.id_sum += (int64_t)id; agg.amount_sum += cents;
             if (agg.count == 1) { agg.amount_min = agg.amount_max = cents; }
             else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
-            agg.name_bytes += name_len; agg.note_bytes += note_len; my_names[cid].push_back(name_hash);
+            agg.name_bytes += name_len; agg.note_bytes += note_len;
+            my_names.push_back(((uint64_t)cid << 32) | name_hash);
         }
 
-        for (uint16_t c = 0; c <= num_countries; ++c) {
-            auto& v = my_names[c];
-            if (!v.empty()) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); v.shrink_to_fit(); }
-        }
+        std::sort(my_names.begin(), my_names.end());
+        my_names.erase(std::unique(my_names.begin(), my_names.end()), my_names.end());
+        my_names.shrink_to_fit();
+        size_t ucount = my_names.size();
+
+        auto& c_offset = tdata[t].c_offset; memset(c_offset, 0, sizeof(c_offset));
+        for (size_t i = 0; i < ucount; ++i) c_offset[(my_names[i] >> 32) + 1]++;
+        for (int i = 1; i <= 241; ++i) c_offset[i] += c_offset[i - 1];
 
 #ifndef _WIN32
         uintptr_t s = ((uintptr_t)last_evicted + 4095ULL) & ~4095ULL, e = ((uintptr_t)chunk_end) & ~4095ULL;
@@ -249,7 +251,7 @@ int main(int argc, char* argv[]) {
 
         uint16_t total_c = num_countries + 1, idx_start = (uint16_t)(((uint32_t)total_c * t) / nthreads), idx_end = (uint16_t)(((uint32_t)total_c * (t + 1)) / nthreads);
         char line_buf[256]; auto& out_buf = tdata[t].out_buf; out_buf.reserve((idx_end - idx_start) * 64);
-        std::vector<uint64_t> all_names; all_names.reserve(2048);
+        std::vector<uint32_t> all_names; all_names.reserve(2048);
 
         for (uint16_t idx = idx_start; idx < idx_end; ++idx) {
             uint8_t c = out_order[idx];
@@ -261,9 +263,8 @@ int main(int argc, char* argv[]) {
                 count += o.count; id_sum += o.id_sum; amt_sum += o.amount_sum;
                 amt_min = std::min(amt_min, o.amount_min); amt_max = std::max(amt_max, o.amount_max);
                 name_bytes += o.name_bytes; note_bytes += o.note_bytes;
-                auto& nms = tdata[ot].country_names[c];
-                all_names.insert(all_names.end(), nms.begin(), nms.end());
-                std::vector<uint64_t>().swap(nms);
+                size_t start = tdata[ot].c_offset[c], end = tdata[ot].c_offset[c + 1];
+                for (size_t k = start; k < end; ++k) all_names.push_back((uint32_t)tdata[ot].my_names[k]);
             }
             if (!count) continue;
 

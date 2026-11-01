@@ -88,7 +88,7 @@ inline uint64_t hash_endpoint(const char* s, size_t len) {
 }
 
 static constexpr size_t MAX_EP = 2048, MAX_H = 72;
-struct EpEntry { uint64_t hash = 0; uint16_t len = 0, local_id = 0, global_id = 0; };
+struct EpEntry { uint64_t hash = 0; uint32_t global_id = 0; uint16_t len = 0, local_id = 0; };
 struct EndpointTable {
     static constexpr size_t CAP = 8192, MASK = CAP - 1;
     EpEntry entries[CAP];
@@ -99,9 +99,9 @@ struct EndpointTable {
             if (entries[idx].hash == h && entries[idx].len == len && !memcmp(eps[entries[idx].local_id].data(), s, len)) return entries[idx].local_id;
             idx = (idx + 1) & MASK;
         }
-        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, len, lid, 0}; return lid;
+        uint16_t lid = (uint16_t)eps.size(); eps.emplace_back(s, len); entries[idx] = {h, 0, len, lid}; return lid;
     }
-    inline uint16_t lookup(uint16_t len, uint64_t h) const {
+    inline uint32_t lookup(uint16_t len, uint64_t h) const {
         size_t idx = h & MASK;
         while (true) {
             if (entries[idx].hash == h && entries[idx].len == len) return entries[idx].global_id;
@@ -158,8 +158,7 @@ int main(int argc, char* argv[]) {
         const char* p = mf.data + chunks[t].start, *end = mf.data + chunks[t].end;
         uint64_t last_tag = 0; int last_hid = -1;
         __m256i sp = _mm256_set1_epi8(' '), nl = _mm256_set1_epi8('\n');
-        uintptr_t last_evict = (uintptr_t)p & ~4095ULL;
-        // Pass 1: AVX2 scanning of method, endpoint, status, and sliding madvise
+        // Pass 1: AVX2 scanning of method, endpoint, status (pages stay in cache for Pass 2)
         while (p < end) {
             if (p + 27 > end) break;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
@@ -177,9 +176,7 @@ int main(int argc, char* argv[]) {
             td.counts[idx]++;
             if (cur[1] == '5') td.errors[idx]++;
             p = find_char_avx2<'\n'>(cur + 5, end, nl) + 1;
-            if ((size_t)((uintptr_t)p - last_evict) >= 524288) { uintptr_t cp = (uintptr_t)p & ~4095ULL; evict_range(last_evict, cp); last_evict = cp; }
         }
-        evict_range(last_evict, ((uintptr_t)end + 4095ULL) & ~4095ULL);
         sync_point.arrive_and_wait();
 
         if (t == 0) {
@@ -231,7 +228,7 @@ int main(int argc, char* argv[]) {
         sync_point.arrive_and_wait();
         // Pass 2: AVX2 scanning and streaming latencies into flat all_latencies array
         p = mf.data + chunks[t].start; last_hid = -1; last_tag = 0;
-        last_evict = (uintptr_t)p & ~4095ULL;
+        uintptr_t last_evict = (uintptr_t)p & ~4095ULL;
         while (p < end) {
             if (p + 27 > end) break;
             uint64_t cur_tag; memcpy(&cur_tag, p + 5, 8);
@@ -244,7 +241,7 @@ int main(int argc, char* argv[]) {
             cur = find_char_avx2<' '>(cur, end, sp);
             uint16_t ep_len = (uint16_t)(cur - ep_start);
             uint64_t ep_hash = hash_endpoint(ep_start, ep_len);
-            uint16_t gep = td.ep_table.lookup(ep_len, ep_hash);
+            uint32_t gep = td.ep_table.lookup(ep_len, ep_hash);
             cur += 5;
             uint32_t lat = (uint8_t)(*cur++ - '0');
             while ((uint8_t)(*cur - '0') <= 9) lat = lat * 10 + (uint8_t)(*cur++ - '0');

@@ -404,7 +404,6 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<uint32_t>> thread_df(num_threads, std::vector<uint32_t>(num_query_terms, 0));
     std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_query_terms, 0));
-    std::vector<uint32_t> thread_first_doc(num_threads, UINT32_MAX), thread_last_doc(num_threads, 0);
 
     size_t chunk_bytes = docs_file.size / num_threads;
     size_t num_queries = queries.size();
@@ -418,7 +417,7 @@ int main(int argc, char** argv) {
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             // ==========================================
-            // Pass 1: Fused Boundary Scan + Document Frequency (DF) Count
+            // Pass 1: Fused Boundary Scan + Document Frequency (DF) Count + In-Memory Postings Cache
             // ==========================================
             size_t b_start = tid * chunk_bytes;
             size_t b_end = (tid == num_threads - 1) ? docs_file.size : (tid + 1) * chunk_bytes;
@@ -432,6 +431,8 @@ int main(int argc, char** argv) {
 
             uint32_t* my_df = thread_df[tid].data();
             uint32_t doc_terms_buf[1024];
+            std::vector<uint32_t> my_matches;
+            my_matches.reserve(65536);
 
             while (p < docs_file.data + b_end && p < file_end) {
                 const char* tab_pos = find_char_avx2(p, file_end, '\t');
@@ -445,16 +446,21 @@ int main(int argc, char** argv) {
                 const char* text_start = tab_pos + 1;
                 const char* text_end = find_char_avx2(text_start, file_end, '\n');
 
-                if (thread_first_doc[tid] == UINT32_MAX) thread_first_doc[tid] = doc_id;
-                thread_last_doc[tid] = doc_id + 1;
-
                 if (doc_id < N) {
                     doc_offsets[doc_id] = (uint32_t)(text_start - docs_file.data);
                     doc_lens[doc_id] = (uint32_t)(text_end - text_start);
                 }
 
                 uint32_t unique_count = extract_doc_terms(text_start, text_end, term_table, doc_terms_buf);
-                for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
+                if (unique_count > 0) {
+                    my_matches.push_back(doc_id);
+                    my_matches.push_back(unique_count);
+                    for (uint32_t j = 0; j < unique_count; ++j) {
+                        uint32_t term_id = doc_terms_buf[j];
+                        my_df[term_id]++;
+                        my_matches.push_back(term_id);
+                    }
+                }
                 p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
             }
 
@@ -487,57 +493,42 @@ int main(int argc, char** argv) {
                 size_t dense_u64 = (size_t)num_dense_terms * num_words;
                 dense_bitsets = (uint64_t*)calloc(dense_u64 > 0 ? dense_u64 : 1, sizeof(uint64_t));
                 sparse_postings = (uint32_t*)malloc((size_t)(total_sparse_postings > 0 ? total_sparse_postings : 1) * sizeof(uint32_t));
+#ifndef _WIN32
+                madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
+#endif
             }
 
             sync_point.arrive_and_wait();
 
             // ==========================================
-            // Pass 2: Populate dense bitsets and sorted sparse postings
+            // Pass 2: Instant in-memory scatter into bitsets and sparse postings (ZERO file reads!)
             // ==========================================
-            size_t d_start = (thread_first_doc[tid] != UINT32_MAX) ? thread_first_doc[tid] : 0;
-            size_t d_end = (thread_first_doc[tid] != UINT32_MAX) ? thread_last_doc[tid] : 0;
             uint32_t* my_write_offsets = thread_write_offsets[tid].data();
-#ifndef _WIN32
-            uint32_t last_evict = (d_start < d_end) ? doc_offsets[d_start] : 0;
-#endif
+            const uint32_t* ptr = my_matches.data();
+            const uint32_t* end = ptr + my_matches.size();
 
-            for (size_t d = d_start; d < d_end; ++d) {
-                const char* dp = docs_file.data + doc_offsets[d];
-                const char* text_end = dp + doc_lens[d];
-                size_t word_idx = d >> 6;
-                uint64_t bit_mask = 1ULL << (d & 63);
-                uint32_t unique_count = extract_doc_terms(dp, text_end, term_table, doc_terms_buf);
-                for (uint32_t j = 0; j < unique_count; ++j) {
-                    uint32_t term_id = doc_terms_buf[j];
+            while (ptr < end) {
+                uint32_t doc_id = *ptr++;
+                uint32_t count = *ptr++;
+                size_t word_idx = doc_id >> 6;
+                uint64_t bit_mask = 1ULL << (doc_id & 63);
+
+                for (uint32_t j = 0; j < count; ++j) {
+                    uint32_t term_id = *ptr++;
                     const TermInfo& ti = terms[term_id];
                     if (ti.dense_idx != UINT32_MAX) {
                         __atomic_fetch_or(&dense_bitsets[ti.dense_idx * num_words + word_idx], bit_mask, __ATOMIC_RELAXED);
                     } else {
-                        sparse_postings[my_write_offsets[term_id]++] = (uint32_t)d;
+                        sparse_postings[my_write_offsets[term_id]++] = doc_id;
                     }
                 }
-
-#ifndef _WIN32
-                uint32_t cur_offset = doc_offsets[d];
-                if (cur_offset - last_evict >= (512 * 1024)) {
-                    uintptr_t evict_start = (uintptr_t)(docs_file.data + last_evict) & ~4095ULL;
-                    uintptr_t evict_end = (uintptr_t)(docs_file.data + cur_offset) & ~4095ULL;
-                    if (evict_end > evict_start) {
-                        madvise((void*)evict_start, evict_end - evict_start, MADV_DONTNEED);
-                    }
-                    last_evict = cur_offset;
-                }
-#endif
             }
+            std::vector<uint32_t>().swap(my_matches);
 
             sync_point.arrive_and_wait();
             if (tid == 0) {
                 if (profile) t_pass2 = std::chrono::high_resolution_clock::now();
                 std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
-#ifndef _WIN32
-                // Ensure all mapped file pages are dropped from process RSS
-                madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
-#endif
             }
             sync_point.arrive_and_wait();
 
