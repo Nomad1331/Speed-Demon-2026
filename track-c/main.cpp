@@ -44,6 +44,37 @@ inline char* format_money(char* p, int64_t c) {
     *p++ = '0' + (frac / 10); *p++ = '0' + (frac % 10); return p;
 }
 
+// SWAR 8-digit parser
+static inline uint32_t digits8(uint64_t w) noexcept {
+    w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+    w = ((w & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+    return static_cast<uint32_t>(((w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32);
+}
+
+static inline uint32_t read_uint32(const char*& p) noexcept {
+    uint64_t w; std::memcpy(&w, p, 8);
+    w ^= 0x3030303030303030ULL;
+    const uint64_t stop = ((w + 0x7676767676767676ULL) | w) & 0x8080808080808080ULL;
+    if (stop) {
+        const unsigned digits = static_cast<unsigned>(__builtin_ctzll(stop)) >> 3;
+        if (!digits) return 0;
+        p += digits;
+        return digits8(w << ((8 - digits) * 8));
+    }
+    uint32_t n = digits8(w);
+    for (p += 8; *p >= '0' && *p <= '9'; ++p) n = n * 10u + static_cast<uint32_t>(*p - '0');
+    return n;
+}
+
+static inline int64_t read_cents(const char*& p) noexcept {
+    const bool neg = (*p == '-'); if (neg) ++p;
+    const int64_t whole = read_uint32(p);
+    ++p; // skip '.'
+    const int64_t cents = whole * 100 + int64_t(p[0] - '0') * 10 + int64_t(p[1] - '0');
+    p += 2;
+    return neg ? -cents : cents;
+}
+
 struct MappedFile {
     const char* data = nullptr; size_t size = 0; int fd = -1;
     bool open(const std::string& path) {
@@ -59,11 +90,11 @@ struct MappedFile {
     ~MappedFile() { close(); }
 };
 
-// 1 MB SIMD 4-slot hash table (131,072 slots -> 1 MB, stays 100% in L2 cache!)
-static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
+// 262,144 slots (2 MB table) -> 38% load factor, 99% hit on first probe!
+static constexpr u32 BITS = 18, SLOTS = 1 << BITS;
 alignas(64) static std::atomic<u64> g_slots[SLOTS];
 
-// Country bitsets: 256 countries * 2048 words (4 MB total)
+// Country bitsets: 256 countries * 4096 words (8 MB total)
 static constexpr u32 WORDS_PER_COUNTRY = SLOTS / 64;
 alignas(64) static std::atomic<u64> g_seen_bits[256 * WORDS_PER_COUNTRY];
 
@@ -121,21 +152,28 @@ int main(int argc, char* argv[]) {
     const char* rptr = mf_regions.data, *rend = mf_regions.data + mf_regions.size;
     while (rptr < rend && *rptr != '\n') rptr++;
     if (rptr < rend && *rptr == '\n') rptr++;
+
+    struct RegPair { uint32_t rid; uint16_t pack; };
+    std::vector<RegPair> r_pairs; r_pairs.reserve(200000);
     bool seen[26 * 26 * 26] = {false};
     uint32_t unique_codes[256]; uint16_t num_countries = 0;
     const char* p = rptr;
     while (p < rend) {
-        while (p < rend && *p != ',') p++;
+        uint32_t rid = read_uint32(p);
+        if (p < rend && *p == ',') p++;
         if (p >= rend) break;
-        p++;
         uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
         if (!seen[pack]) {
             seen[pack] = true;
             unique_codes[num_countries++] = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
         }
-        p += 3; while (p < rend && *p != '\n') p++;
+        r_pairs.push_back({rid, pack});
+        p += 3;
+        while (p < rend && *p != '\n') p++;
         if (p < rend && *p == '\n') p++;
     }
+    mf_regions.close();
+
     std::sort(unique_codes, unique_codes + num_countries);
     uint8_t pack_to_id[26 * 26 * 26]; memset(pack_to_id, 0, sizeof(pack_to_id));
     for (uint16_t i = 0; i < num_countries; ++i) {
@@ -143,21 +181,12 @@ int main(int argc, char* argv[]) {
         uint16_t pack = (uint16_t)((((c >> 16) & 0xff) - 'A') * 26 * 26 + (((c >> 8) & 0xff) - 'A') * 26 + ((c & 0xff) - 'A'));
         pack_to_id[pack] = (uint8_t)(i + 1);
     }
-    p = rptr;
-    while (p < rend) {
-        uint32_t id = (uint8_t)(*p++ - '0');
-        while ((uint8_t)(*p - '0') <= 9) id = id * 10 + (uint8_t)(*p++ - '0');
-        p++;
-        uint16_t pack = (uint16_t)(((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A'));
-        if (id < 1000000) region_to_country[id] = pack_to_id[pack];
-        p += 3; while (p < rend && *p != '\n') p++;
-        if (p < rend && *p == '\n') p++;
+    for (const auto& rp : r_pairs) {
+        if (rp.rid < 1000000) region_to_country[rp.rid] = pack_to_id[rp.pack];
     }
-    mf_regions.close();
 
     MappedFile mf_records;
     if (!mf_records.open((std::filesystem::path(data_dir) / "records.csv").string())) return 1;
-    madvise((void*)mf_records.data, mf_records.size, MADV_WILLNEED | MADV_SEQUENTIAL);
     const char* ptr0 = mf_records.data, *file_end = mf_records.data + mf_records.size;
     if (ptr0 + 3 <= file_end && (uint8_t)ptr0[0] == 0xef && (uint8_t)ptr0[1] == 0xbb && (uint8_t)ptr0[2] == 0xbf) ptr0 += 3;
     while (ptr0 < file_end && *ptr0 != '\n') ptr0++;
@@ -166,7 +195,6 @@ int main(int argc, char* argv[]) {
     unsigned int nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
     if (mf_records.size < 200000) nthreads = 1;
 
-    // 96 pieces for dynamic work stealing (8 pieces per thread)
     const unsigned int num_pieces = (nthreads == 1) ? 1 : 96;
     std::vector<Chunk> chunks(num_pieces);
     chunks[0].start = ptr0;
@@ -202,47 +230,20 @@ int main(int argc, char* argv[]) {
         auto& my_countries = tdata[t].countries;
         __m256i v_comma = _mm256_set1_epi8(','), v_quote = _mm256_set1_epi8('"');
 
-        // 16-record ring buffer to overlap memory latency
-        constexpr size_t LAG = 16;
-        struct PendingRec {
-            uint64_t name_hash;
-            uint64_t id;
-            int64_t cents;
-            size_t name_len;
-            size_t note_len;
-            uint32_t region_id;
-        } ring[LAG];
-
-        auto process_pending = [&](const PendingRec& rec) {
-            uint8_t cid = (rec.region_id < 1000000) ? region_to_country[rec.region_id] : 0;
-            LocalCountryAgg& agg = my_countries[cid];
-            if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = rec.cents; }
-            else { agg.amount_min = std::min(agg.amount_min, rec.cents); agg.amount_max = std::max(agg.amount_max, rec.cents); }
-            agg.count++; agg.id_sum += rec.id; agg.amount_sum += rec.cents;
-            agg.name_bytes += rec.name_len; agg.note_bytes += rec.note_len;
-
-            uint64_t nh = rec.name_hash ? rec.name_hash : 1;
-            u32 name_id = get_name_id(nh);
-            if (mark_seen(cid, name_id)) {
-                agg.distinct_names++;
-            }
-        };
-
         for (;;) {
             unsigned int p_idx = piece_idx.fetch_add(1, std::memory_order_relaxed);
             if (p_idx >= num_pieces) break;
 
             const char* ptr = chunks[p_idx].start, *chunk_end = chunks[p_idx].end;
-            size_t ring_count = 0;
 
             while (ptr < chunk_end) {
                 _mm_prefetch(ptr + 2048, _MM_HINT_T0);
                 if (__builtin_expect((uint8_t)*ptr == 0xef, 0)) {
                     if (ptr + 3 <= chunk_end && (uint8_t)ptr[1] == 0xbb && (uint8_t)ptr[2] == 0xbf) ptr += 3;
                 }
-                uint64_t id = (uint8_t)(*ptr++ - '0');
-                while ((uint8_t)(*ptr - '0') <= 9) id = id * 10 + (uint8_t)(*ptr++ - '0');
-                ptr++;
+                uint64_t id = read_uint32(ptr);
+                if (ptr < chunk_end && *ptr == ',') ptr++;
+
                 uint32_t crc = 0; size_t name_len = 0;
                 if (__builtin_expect(*ptr == '"', 1)) {
                     ptr++;
@@ -326,44 +327,25 @@ int main(int argc, char* argv[]) {
                 }
             note_done:
 
-                uint32_t region_id = (uint8_t)(*ptr++ - '0');
-                while ((uint8_t)(*ptr - '0') <= 9) region_id = region_id * 10 + (uint8_t)(*ptr++ - '0');
-                ptr++;
-                bool neg = (*ptr == '-'); ptr += neg;
-                int64_t cents = (uint8_t)(*ptr++ - '0');
-                while ((uint8_t)(*ptr - '0') <= 9) cents = cents * 10 + (uint8_t)(*ptr++ - '0');
-                ptr++; cents = cents * 100 + (uint8_t)(ptr[0] - '0') * 10 + (uint8_t)(ptr[1] - '0'); ptr += 2;
-                if (neg) cents = -cents;
+                uint32_t region_id = read_uint32(ptr);
+                if (ptr < chunk_end && *ptr == ',') ptr++;
+
+                int64_t cents = read_cents(ptr);
                 if (__builtin_expect(ptr < chunk_end, 1)) { ptr += (*ptr == '\r'); ptr += (*ptr == '\n'); }
 
-                // Prefetch table slots
+                uint8_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0;
+                LocalCountryAgg& agg = my_countries[cid];
+                if (__builtin_expect(agg.count == 0, 0)) { agg.amount_min = agg.amount_max = cents; }
+                else { agg.amount_min = std::min(agg.amount_min, cents); agg.amount_max = std::max(agg.amount_max, cents); }
+                agg.count++; agg.id_sum += id; agg.amount_sum += cents;
+                agg.name_bytes += name_len; agg.note_bytes += note_len;
+
                 uint64_t nh = name_hash ? name_hash : 1;
-                u32 probe_idx = (u32)((nh ^ (nh >> 16)) & (SLOTS - 1)) & ~3u;
-                _mm_prefetch(reinterpret_cast<const char*>(&g_slots[probe_idx]), _MM_HINT_T0);
-                if (region_id < 1000000) {
-                    _mm_prefetch(reinterpret_cast<const char*>(&region_to_country[region_id]), _MM_HINT_T0);
-                    uint8_t pre_cid = region_to_country[region_id];
-                    size_t seen_idx = (size_t)pre_cid * WORDS_PER_COUNTRY + (probe_idx >> 6);
-                    __builtin_prefetch(&g_seen_bits[seen_idx], 1);
+                u32 name_id = get_name_id(nh);
+                if (mark_seen(cid, name_id)) {
+                    agg.distinct_names++;
                 }
-
-                size_t ring_slot = ring_count % LAG;
-                if (ring_count >= LAG) {
-                    process_pending(ring[ring_slot]);
-                }
-                ring[ring_slot] = {name_hash, id, cents, name_len, note_len, region_id};
-                ring_count++;
             }
-
-            // Drain remaining in ring
-            size_t start_drain = (ring_count >= LAG) ? ring_count - LAG : 0;
-            for (size_t i = start_drain; i < ring_count; ++i) {
-                process_pending(ring[i % LAG]);
-            }
-
-            uintptr_t p_from = reinterpret_cast<uintptr_t>(chunks[p_idx].start) & ~uintptr_t(4095);
-            uintptr_t p_to = reinterpret_cast<uintptr_t>(chunks[p_idx].end) & ~uintptr_t(4095);
-            if (p_to > p_from) madvise(reinterpret_cast<void*>(p_from), p_to - p_from, MADV_DONTNEED);
         }
     };
 
@@ -372,40 +354,51 @@ int main(int argc, char* argv[]) {
     for (unsigned int i = 0; i < nthreads; ++i) workers.emplace_back(worker_fn, i);
     for (auto& w : workers) w.join();
 
-    FILE* fp = fopen(out_path.string().c_str(), "wb");
-    if (!fp) return 1;
-    char out_buf[1024];
+    LocalCountryAgg final_countries[241];
+    for (unsigned int t = 0; t < nthreads; ++t) {
+        for (int c = 0; c < 241; ++c) {
+            auto& src = tdata[t].countries[c];
+            if (!src.count) continue;
+            auto& dst = final_countries[c];
+            if (dst.count == 0) { dst.amount_min = src.amount_min; dst.amount_max = src.amount_max; }
+            else { dst.amount_min = std::min(dst.amount_min, src.amount_min); dst.amount_max = std::max(dst.amount_max, src.amount_max); }
+            dst.count += src.count; dst.id_sum += src.id_sum; dst.amount_sum += src.amount_sum;
+            dst.distinct_names += src.distinct_names;
+            dst.name_bytes += src.name_bytes; dst.note_bytes += src.note_bytes;
+        }
+    }
+
+    char* out_buf = (char*)malloc(256 * 1024);
+    char* optr = out_buf;
     for (uint16_t i = 0; i <= num_countries; ++i) {
         uint8_t cid = out_order[i];
-        LocalCountryAgg total;
-        bool any = false;
-        for (unsigned int t = 0; t < nthreads; ++t) {
-            const auto& src = tdata[t].countries[cid];
-            if (src.count > 0) {
-                if (!any) { total.amount_min = src.amount_min; total.amount_max = src.amount_max; any = true; }
-                else { total.amount_min = std::min(total.amount_min, src.amount_min); total.amount_max = std::max(total.amount_max, src.amount_max); }
-                total.count += src.count; total.id_sum += src.id_sum; total.amount_sum += src.amount_sum;
-                total.name_bytes += src.name_bytes; total.note_bytes += src.note_bytes;
-                total.distinct_names += src.distinct_names;
-            }
-        }
-        if (!any) continue;
-        char* cur = out_buf;
-        if (cid == 0) { memcpy(cur, "_UNMATCHED ", 11); cur += 11; }
+        const auto& c = final_countries[cid];
+        if (!c.count) continue;
+        if (cid == 0) { memcpy(optr, "_UNMATCHED ", 11); optr += 11; }
         else {
             uint32_t code = unique_codes[cid - 1];
-            *cur++ = (char)((code >> 16) & 0xff); *cur++ = (char)((code >> 8) & 0xff); *cur++ = (char)(code & 0xff); *cur++ = ' ';
+            optr[0] = (char)((code >> 16) & 0xff); optr[1] = (char)((code >> 8) & 0xff); optr[2] = (char)(code & 0xff); optr[3] = ' ';
+            optr += 4;
         }
-        cur = write_u64(cur, total.count); *cur++ = ' ';
-        cur = write_u64(cur, total.id_sum); *cur++ = ' ';
-        cur = format_money(cur, total.amount_sum); *cur++ = ' ';
-        cur = format_money(cur, total.amount_min); *cur++ = ' ';
-        cur = format_money(cur, total.amount_max); *cur++ = ' ';
-        cur = write_u64(cur, total.distinct_names); *cur++ = ' ';
-        cur = write_u64(cur, total.name_bytes); *cur++ = ' ';
-        cur = write_u64(cur, total.note_bytes); *cur++ = '\n';
-        fwrite(out_buf, 1, cur - out_buf, fp);
+        optr = write_u64(optr, c.count); *optr++ = ' ';
+        optr = write_u64(optr, c.id_sum); *optr++ = ' ';
+        optr = format_money(optr, c.amount_sum); *optr++ = ' ';
+        optr = format_money(optr, c.amount_min); *optr++ = ' ';
+        optr = format_money(optr, c.amount_max); *optr++ = ' ';
+        optr = write_u64(optr, c.distinct_names); *optr++ = ' ';
+        optr = write_u64(optr, c.name_bytes); *optr++ = ' ';
+        optr = write_u64(optr, c.note_bytes); *optr++ = '\n';
     }
-    fclose(fp);
+
+    int out_fd = ::open(out_path.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
+    if (out_fd >= 0) {
+        size_t written = 0, total = optr - out_buf;
+        while (written < total) {
+            ssize_t w = ::write(out_fd, out_buf + written, total - written);
+            if (w <= 0) break;
+            written += w;
+        }
+        ::close(out_fd);
+    }
     _exit(0);
 }

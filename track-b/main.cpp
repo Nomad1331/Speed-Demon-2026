@@ -145,7 +145,7 @@ public:
     void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
 
     // h is hash_key(k), computed (and prefetched) earlier by the caller.
-    u32 find(const Key& k, u64 h) const {
+    u32 find(u64 h) const {
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
             u64 s = slots_[i];
             if (s == 0) return NONE;
@@ -186,7 +186,6 @@ inline u64 token_bytes(const uint8_t* p) {
 template <class F>
 inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& terms, F&& emit) {
     constexpr size_t LAG = 8;
-    Key keys[LAG];
     u64 hashes[LAG];
     const uint8_t* starts[LAG];
     size_t n = 0;
@@ -221,13 +220,12 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
         const u64 h = hash_key(k);
         terms.prefetch(h);
         const size_t slot = n++ % LAG;
-        if (n > LAG) emit(terms.find(keys[slot], hashes[slot]), starts[slot]);
-        keys[slot] = k;
-        hashes[slot] = h;
+        if (n > LAG) emit(terms.find(hashes[slot]), starts[slot]);
+hashes[slot] = h;
         starts[slot] = s;
     }
     for (size_t i = n > LAG ? n - LAG : 0; i < n; ++i)
-        emit(terms.find(keys[i % LAG], hashes[i % LAG]), starts[i % LAG]);
+        emit(terms.find(hashes[i % LAG]), starts[i % LAG]);
 }
 
 // One query, as views into the flat arrays below.

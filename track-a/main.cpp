@@ -340,10 +340,7 @@ int main(int argc, char** argv) {
       parsers[t].map(size);
       for (int k; (k = claim_piece++) < pieces;) {
         parsers[t].run(log + cut[k], log + cut[k + 1]);
-        uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
-                  b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
-        if (b > a)
-          madvise((void *)a, b - a, MADV_DONTNEED);
+
       }
       ranked.arrive_and_wait();
       {
@@ -405,6 +402,8 @@ int main(int argc, char** argv) {
           *o++ = '\n';
         }
         std::vector<Line>().swap(lines[h]);
+        static std::atomic<int> hours_done{0};
+        if (++hours_done == HOURS) { _exit(0); }
       }
     });
   for (auto &th : pool)
