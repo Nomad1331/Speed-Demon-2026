@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <chrono>
 #include <immintrin.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -137,7 +136,8 @@ struct TermTable {
     }
 };
 
-inline uint32_t extract_doc_terms(const char* dp, const char* text_end, const TermTable& term_table, uint32_t* doc_terms_buf) {
+inline uint32_t extract_doc_terms_fast(const char* dp, const char* text_end, const TermTable& term_table,
+                                       uint32_t doc_id, uint32_t* last_seen, uint32_t* doc_terms_buf) {
     uint32_t num_doc_terms = 0;
     while (dp < text_end) {
         uint8_t c = CHAR_MAP[(unsigned char)*dp++];
@@ -157,16 +157,14 @@ inline uint32_t extract_doc_terms(const char* dp, const char* text_end, const Te
         if (!((FILTER_BITMAP[b2 >> 6] >> (b2 & 63)) & 1ULL)) continue;
 
         uint32_t term_id = term_table.lookup(crc, tok_start, tok_len);
-        if (term_id != UINT32_MAX && num_doc_terms < 1024) doc_terms_buf[num_doc_terms++] = term_id;
+        if (term_id != UINT32_MAX && num_doc_terms < 1024) {
+            if (last_seen[term_id] != doc_id) {
+                last_seen[term_id] = doc_id;
+                doc_terms_buf[num_doc_terms++] = term_id;
+            }
+        }
     }
-    if (num_doc_terms <= 1) return num_doc_terms;
-    if (num_doc_terms == 2) {
-        if (doc_terms_buf[0] == doc_terms_buf[1]) return 1;
-        if (doc_terms_buf[0] > doc_terms_buf[1]) std::swap(doc_terms_buf[0], doc_terms_buf[1]);
-        return 2;
-    }
-    std::sort(doc_terms_buf, doc_terms_buf + num_doc_terms);
-    return (uint32_t)(std::unique(doc_terms_buf, doc_terms_buf + num_doc_terms) - doc_terms_buf);
+    return num_doc_terms;
 }
 
 enum class QueryType : uint8_t { BOOL_QUERY, PHRASE_QUERY };
@@ -241,7 +239,6 @@ int main(int argc, char** argv) {
     init_char_map();
     init_lut16();
 
-    // 1. Memory-map queries.txt and parse all queries
     std::string queries_path = data_dir + "/queries.txt";
     MappedFile queries_file;
     if (!queries_file.open(queries_path)) return 1;
@@ -252,7 +249,6 @@ int main(int argc, char** argv) {
     queries.reserve(65536);
 
     const char* qp = queries_file.data, *qend = queries_file.data + queries_file.size;
-
     auto register_term = [&](std::string_view tok) -> uint32_t {
         uint32_t crc = compute_crc(tok.data(), (uint32_t)tok.size());
         uint32_t tid = term_table.get_or_insert(tok.data(), (uint32_t)tok.size(), crc);
@@ -306,7 +302,6 @@ int main(int argc, char** argv) {
 
     uint32_t num_query_terms = term_table.num_terms;
 
-    // 2. Memory-map docs.txt and determine total N
     std::string docs_path = data_dir + "/docs.txt";
     MappedFile docs_file;
     if (!docs_file.open(docs_path)) return 1;
@@ -330,7 +325,6 @@ int main(int argc, char** argv) {
     if (hw_threads == 0) hw_threads = 8;
     unsigned int num_threads = std::min(hw_threads, 16u);
 
-    // Adaptive threshold: N / 32 (3.125% of N)
     uint32_t DF_THRESHOLD = std::max(256u, (uint32_t)(N / 32));
 
     std::vector<TermInfo> terms(num_query_terms);
@@ -354,16 +348,21 @@ int main(int argc, char** argv) {
         workers.emplace_back([&, tid]() {
             size_t b_start = tid * chunk_bytes;
             size_t b_end = (tid == num_threads - 1) ? docs_file.size : (tid + 1) * chunk_bytes;
+
             const char* file_end = docs_file.data + docs_file.size;
             const char* p = docs_file.data + b_start;
             if (tid > 0) {
                 p = find_char_avx2(p, file_end, '\n');
                 if (p < file_end && *p == '\n') p++;
             }
+
             uint32_t* my_df = thread_df[tid].data();
             uint32_t doc_terms_buf[1024];
+            std::vector<uint32_t> last_seen(num_query_terms, 0xFFFFFFFF);
             MatchWriter& writer = thread_writers[tid];
             writer.init();
+
+            const char* last_evicted = p;
 
             while (p < docs_file.data + b_end && p < file_end) {
                 const char* tab_pos = find_char_avx2(p, file_end, '\t');
@@ -377,18 +376,30 @@ int main(int argc, char** argv) {
 
                 if (doc_id < N) doc_offsets[doc_id] = (uint32_t)(text_start - docs_file.data);
 
-                uint32_t unique_count = extract_doc_terms(text_start, text_end, term_table, doc_terms_buf);
+                uint32_t unique_count = extract_doc_terms_fast(text_start, text_end, term_table, doc_id, last_seen.data(), doc_terms_buf);
                 if (unique_count > 0) {
                     for (uint32_t j = 0; j < unique_count; ++j) my_df[doc_terms_buf[j]]++;
                     writer.push_doc(doc_id, unique_count, doc_terms_buf);
                 }
                 p = (text_end < file_end && *text_end == '\n') ? text_end + 1 : file_end;
+
+                if ((size_t)(p - last_evicted) >= 524288) {
+                    uintptr_t s = (uintptr_t)last_evicted & ~4095ULL;
+                    uintptr_t e = (uintptr_t)p & ~4095ULL;
+                    if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
+                    last_evicted = p;
+                }
+            }
+            if (p > last_evicted) {
+                uintptr_t s = (uintptr_t)last_evicted & ~4095ULL;
+                uintptr_t e = (uintptr_t)p & ~4095ULL;
+                if (e > s) madvise((void*)s, e - s, MADV_DONTNEED);
             }
 
             sync_point.arrive_and_wait();
 
-            // Thread 0 allocates dense & sparse pools
             if (tid == 0) {
+                madvise((void*)docs_file.data, docs_file.size, MADV_DONTNEED);
                 uint32_t cur_sparse_offset = 0;
                 for (uint32_t t = 0; t < num_query_terms; ++t) {
                     uint32_t tot = 0;
@@ -416,6 +427,7 @@ int main(int argc, char** argv) {
             }
 
             sync_point.arrive_and_wait();
+
             uint32_t* my_write_offsets = thread_write_offsets[tid].data();
             MatchBlock* b = writer.head;
 
@@ -444,6 +456,7 @@ int main(int argc, char** argv) {
             sync_point.arrive_and_wait();
             if (tid == 0) std::vector<std::vector<uint32_t>>().swap(thread_write_offsets);
             sync_point.arrive_and_wait();
+
             size_t q_start = tid * q_step, q_end = std::min(num_queries, (tid + 1) * q_step);
             std::string& out = thread_outputs[tid];
             out.reserve((q_end > q_start ? (q_end - q_start) : 1) * 32);
@@ -586,7 +599,7 @@ int main(int argc, char** argv) {
                         }
                         emit_result(count, sum, first10, found);
                     }
-                } else { // PHRASE_QUERY
+                } else {
                     bool has_absent = false; int best_idx = 0; uint32_t min_df = terms[q.p.term_ids[0]].df;
                     for (int i = 0; i < q.p.num_terms; ++i) {
                         uint32_t cdf = terms[q.p.term_ids[i]].df;
@@ -665,7 +678,6 @@ int main(int argc, char** argv) {
     }
     for (auto& w : workers) w.join();
 
-    // 3. Output results.txt
     std::filesystem::create_directories(out_dir);
     std::string out_path = out_dir + "/results.txt";
     FILE* fp = fopen(out_path.c_str(), "wb");
@@ -678,5 +690,6 @@ int main(int argc, char** argv) {
 
     if (dense_bitsets) free(dense_bitsets);
     if (sparse_postings) free(sparse_postings);
+
     return 0;
 }
