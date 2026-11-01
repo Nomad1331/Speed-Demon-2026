@@ -79,13 +79,20 @@ struct alignas(32) Key {
 
 // Two independent multiplies; almost every token fits in the first two words.
 inline u64 hash_key(const Key& k) {
+    if (__builtin_expect((k.w[2] | k.w[3]) == 0, 1)) {
+        u64 h = (k.w[0] * 0x9E3779B97F4A7C15ull) ^ (k.w[1] * 0xBF58476D1CE4E5B9ull);
+        return h ^ (h >> 29);
+    }
     u64 h = (k.w[0] + k.w[2] * 0x94D049BB133111EBull) * 0x9E3779B97F4A7C15ull ^
             (k.w[1] + k.w[3] * 0xD6E8FEB86659FD93ull) * 0xBF58476D1CE4E5B9ull;
-    return h ^ h >> 29;
+    return h ^ (h >> 29);
 }
 
 inline bool same(const Key& a, const Key& b) {
-    return ((a.w[0] ^ b.w[0]) | (a.w[1] ^ b.w[1]) | (a.w[2] ^ b.w[2]) | (a.w[3] ^ b.w[3])) == 0;
+    __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.w));
+    __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b.w));
+    __m256i diff = _mm256_xor_si256(va, vb);
+    return _mm256_testz_si256(diff, diff);
 }
 
 // Open-addressing table from term key to a dense term id. Each slot holds the
@@ -466,7 +473,7 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             if (!qs.phrase[i]) continue;
             Query q = qs[i];
             auto a = std::min_element(q.terms.begin(), q.terms.end(), [&](u32 x, u32 y) { return df[x] < df[y]; });
-            if (df[*a] * 200 > docs) continue;
+            if (df[*a] * 32 > docs) continue;
             where[i] = a - q.terms.begin();
             if (!anchor[*a]) anchor[*a] = true, ++nanchors;
         }
