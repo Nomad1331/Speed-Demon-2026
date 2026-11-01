@@ -22,6 +22,8 @@
 - [x] **Iteration 3: Algorithmic Percentiles:** Contiguous latency flattening, `std::nth_element` selection for nearest-rank p50/p95/p99 🟢
 - [x] **Iteration 4: Container Packaging:** Multi-stage Dockerfile matching GCC 16 allowlist and zero-dependency `.speed-demon.toml` 🟢
 - [x] **Iteration 5: Verification:** Byte-identical SHA-256 match on `tiny` and `sample` datasets, achieving 38.38 ms runtime (75.5x speedup) 🟢
+- [x] **Iteration 6: Single-Pass Ingest & Pass 2 Elimination:** Eliminated second file pass over mmap, caching 8-byte `LocalReq` in L3, evicting file via `MADV_DONTNEED`, in-memory scatter into `all_latencies`, wall time $\le 31$ ms, 286 SLOC 🟢
+- [x] **Iteration 7: Zero-Syscall Stream Ingest & Disjoint 2D Scatter Overhaul:** Single-pass packed 64-bit ingest (`((ep_id<<48)|(hid<<32)|lat)`), zero syscalls in inner loop, Thread 0 disjoint `write_offsets[num_threads][G]` calculation, immediate physical file unmapping/closing at Barrier 1, lock-free deterministic scatter into contiguous `all_latencies`, cascaded `std::nth_element` quantile pipeline, compressed to 276 SLOC (strictly $\le 280$). Verified byte-identical SHA-256 on tiny and sample; all 15 unit tests pass 🟢
 
 ---
 

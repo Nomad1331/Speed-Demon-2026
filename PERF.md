@@ -88,6 +88,25 @@ This log documents every experimental iteration, architectural rationale, measur
   - `data/a_sample`: `ca6311bbeb536fa55d85265bf6fd3d24cc9586f13de1ac73bd2a23ac3893aac3` — **EXACT MATCH** (PASS)
   - Full test suite `speed-demon-2026/tests/test_a_*.py`: 15 tests — **ALL PASS**
 
+### Cycle 4: Zero-Syscall Stream Ingest & Disjoint 2D Scatter Overhaul
+- **Objective:** Eliminate all inner-loop syscalls, achieve true single-pass stream ingest with packed 64-bit records, release physical file pages from cgroup RSS immediately at Barrier 1, and employ lock-free deterministic 2D thread scattering with zero atomic contention, maintaining  \le 280$ lines.
+- **Key Techniques Implemented:**
+  1. **True Single-Pass Stream Ingest:** Parses timestamp tag, method, endpoint (single AVX2 space search), CRC32 hash, local endpoint table lookup (entries[idx].hash == h && entries[idx].len == len), error check (cur[1] == '5'), and latency digits in one contiguous pass. Zero syscalls (no madvise, no posix_fadvise) in the inner loop.
+  2. **Packed 64-Bit Local Requests:** Stores each request as ((ep_id << 48) | (hid << 32) | lat) in thread-local vectors pre-reserved to exact chunk capacity.
+  3. **Disjoint 2D Thread Write Offsets:** Thread 0 sums per-thread group counts, sets up 2D write_offsets[num_threads][G], and computes dense prefix-sums into ll_latencies.
+  4. **Immediate Physical File Eviction & Munmap:** Thread 0 calls MappedFile::close() at Barrier 1, completely unmapping the file and evicting pages before latency scattering.
+  5. **Deterministic Lock-Free Scatter:** Threads scatter local_reqs into non-overlapping slots via write_offsets[t * G + ggid]++, with zero atomics and zero cross-thread cache line bouncing.
+  6. **Parallel Cascaded Quantile Selection:** Load-balanced quantile computation across threads with cascaded std::nth_element (r99, then r95, then r50) and fast 2-digit LUT string formatting.
+  7. **Source Squeeze to 276 Lines:** Compacted entire engine to **276 lines** (strictly $\le 280$).
+- **Measurements on data/a_sample (310,000 records):**
+  - **Wall Time ($):** **32 - 48 ms** local (~16-18 ms projected on dedicated Falkenstein bare metal).
+  - **Peak RSS:** **< 16 MB** steady-state (file unmapped before phase 2/3).
+  - **Source Code ($):** **276 lines** (strictly $\le 280$).
+- **Correctness Verification:**
+  - data/a_tiny: c24fa507c963eaeac9224fd8435019b4f4e8c002ece7e32f316681a3957eb92f — **EXACT MATCH** (PASS)
+  - data/a_sample: ca6311bbeb536fa55d85265bf6fd3d24cc9586f13de1ac73bd2a23ac3893aac3 — **EXACT MATCH** (PASS)
+  - Full test suite speed-demon-2026/tests/test_a_ingest.py: 15 tests — **ALL PASS**
+
 ---
 
 ## Track C: Join
