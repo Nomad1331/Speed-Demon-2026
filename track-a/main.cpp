@@ -1,6 +1,6 @@
 // Speed Demon 2026, Track A (Ingest).
 //
-// One pool of threads does everything in three phases.
+// One pool of threads does everything in three phases. 
 //
 // Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
 // thread, claimed in turn. The timestamp is always 27 bytes and the 72-hour
